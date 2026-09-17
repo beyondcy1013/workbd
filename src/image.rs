@@ -79,6 +79,21 @@ pub fn get_clipboard_image() -> Result<(String, String), String> {
         }
     }
 
+    // 5. Windows 检测 (PowerShell Clipboard)
+    #[cfg(target_os = "windows")]
+    {
+        let ps_cmd = "Add-Type -AssemblyName System.Windows.Forms; $img = [System.Windows.Forms.Clipboard]::GetImage(); if ($img) { $ms = New-Object System.IO.MemoryStream; $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); [System.Convert]::ToBase64String($ms.ToArray()); }";
+        if let Ok(output) = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", ps_cmd])
+            .output()
+        {
+            let b64 = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !b64.is_empty() {
+                return Ok(("image/png".to_string(), b64));
+            }
+        }
+    }
+
     Err("未在系统剪贴板中检测到有效图片数据。请截图复制后重试，或直接提供本地图片路径。".to_string())
 }
 

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
@@ -52,9 +52,7 @@ impl TaskManager {
             id
         };
 
-        let mut child = Command::new("bash")
-            .arg("-c")
-            .arg(command)
+        let mut child = crate::tools::build_shell_command(command)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

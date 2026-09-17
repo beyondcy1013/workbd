@@ -348,6 +348,33 @@ pub async fn execute_tool(
     }
 }
 
+pub(crate) fn build_shell_command(command: &str) -> tokio::process::Command {
+    #[cfg(target_os = "windows")]
+    {
+        let has_bash = std::process::Command::new("where")
+            .arg("bash")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if has_bash {
+            let mut c = tokio::process::Command::new("bash");
+            c.arg("-c").arg(command);
+            c
+        } else {
+            let mut c = tokio::process::Command::new("cmd.exe");
+            c.arg("/C").arg(command);
+            c
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut c = tokio::process::Command::new("bash");
+        c.arg("-c").arg(command);
+        c
+    }
+}
+
 async fn run_bash(command: &str, is_background: bool) -> String {
     if is_background {
         match get_task_manager().spawn_task(command).await {
@@ -362,10 +389,7 @@ async fn run_bash(command: &str, is_background: bool) -> String {
     } else {
         let output = match tokio::time::timeout(
             Duration::from_secs(120),
-            tokio::process::Command::new("bash")
-                .arg("-c")
-                .arg(command)
-                .output(),
+            build_shell_command(command).output(),
         )
         .await
         {
