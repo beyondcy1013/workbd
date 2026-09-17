@@ -5,8 +5,9 @@ use colored::*;
 pub fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     let mut total_chars = 0;
     for m in messages {
-        if let Some(ref c) = m.content {
-            total_chars += c.len();
+        let text = m.text_content();
+        if !text.is_empty() {
+            total_chars += text.len();
         }
         if let Some(ref r) = m.reasoning_content {
             total_chars += r.len();
@@ -55,7 +56,8 @@ pub fn compact_context(messages: &mut Vec<ChatMessage>) -> bool {
     for m in slice_to_compact {
         match m.role.as_str() {
             "user" => {
-                if let Some(ref c) = m.content {
+                let c = m.text_content();
+                if !c.is_empty() {
                     let preview = c.lines().next().unwrap_or(c).chars().take(80).collect::<String>();
                     user_goals.push(preview);
                 }

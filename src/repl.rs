@@ -209,6 +209,10 @@ impl ReplSession {
                 }
                 println!("{}", "✔ 会话上下文已清空。".green());
             }
+            "/image" | "/img" => {
+                let text = args.join(" ");
+                self.handle_image_chat(&text).await;
+            }
             "/agent" => {
                 if args.is_empty() {
                     self.agent_mode = !self.agent_mode;
@@ -349,7 +353,7 @@ impl ReplSession {
                     self.config.system_prompt = new_sys.clone();
                     if let Some(first) = self.messages.first_mut() {
                         if first.role == "system" {
-                            first.content = Some(new_sys);
+                            first.set_text_content(new_sys);
                         } else {
                             self.messages.insert(0, ChatMessage::system(new_sys));
                         }
@@ -443,7 +447,114 @@ impl ReplSession {
         println!("✔ 已切换至模型: {}", display_name.green().bold());
     }
 
+    async fn handle_image_chat(&mut self, input: &str) {
+        let input = input.trim();
+        let (image_data, prompt_text) = if !input.is_empty() {
+            let parts: Vec<&str> = input.split_whitespace().collect();
+            let first_clean = parts[0].trim_matches('"').trim_matches('\'');
+            let first_path = std::path::Path::new(first_clean);
+
+            if first_clean == "clipboard" || first_clean == "paste" {
+                let remaining = parts[1..].join(" ");
+                let text = if remaining.trim().is_empty() {
+                    "请详细分析并描述这张图片。".to_string()
+                } else {
+                    remaining
+                };
+                (crate::image::get_clipboard_image(), text)
+            } else if first_path.is_file() && crate::image::is_image_path(first_path) {
+                let remaining = parts[1..].join(" ");
+                let text = if remaining.trim().is_empty() {
+                    "请详细分析并描述这张图片。".to_string()
+                } else {
+                    remaining
+                };
+                (crate::image::load_image_file(first_path), text)
+            } else {
+                // 用户输入的内容作为问题提示词，图片从剪贴板抓取
+                let text = input.to_string();
+                (crate::image::get_clipboard_image(), text)
+            }
+        } else {
+            (crate::image::get_clipboard_image(), "请详细分析并描述这张图片。".to_string())
+        };
+
+        match image_data {
+            Ok((mime, b64)) => {
+                let size_kb = (b64.len() * 3 / 4) / 1024;
+                println!("{} 成功载入图片 (格式: {}, 估算大小: ~{} KB)", "📷".green().bold(), mime, size_kb);
+                self.dispatch_image_turn(&prompt_text, &mime, &b64).await;
+            }
+            Err(e) => {
+                println!("{} 获取图片失败: {}", "✖".red(), e);
+                println!("提示: 可截图复制到系统剪贴板后直接运行 {}，或指定本地路径 {} [问题说明]", "/image".yellow().bold(), "/image <path/to/img.png>".yellow().bold());
+            }
+        }
+    }
+
+    async fn dispatch_image_turn(&mut self, text: &str, mime: &str, b64: &str) {
+        let active_model = if !crate::image::is_vision_model(&self.current_model) {
+            let rec = crate::image::recommended_vision_model();
+            println!(
+                "{} 当前模型 {} 不支持多模态视觉识别，已自动为本轮会话临时选用推荐视觉模型: {}",
+                "ℹ".blue().bold(),
+                self.current_model.yellow(),
+                rec.green().bold()
+            );
+            rec.to_string()
+        } else {
+            self.current_model.clone()
+        };
+
+        self.messages.push(ChatMessage::user_with_image(text, mime, b64));
+
+        let model_name = crate::models_catalog::find_official_model(&active_model)
+            .map(|d| d.name)
+            .unwrap_or(&active_model);
+
+        let model_display = model_name.cyan().bold();
+        let mode_tag = if self.agent_mode { "[Agent+Vision]" } else { "[Vision]" };
+        print!("{} {}: ", mode_tag.dimmed(), model_display);
+        let _ = io::stdout().flush();
+
+        let mut runner = AgentRunner::new(
+            self.client.clone(),
+            active_model,
+            self.config.temperature,
+        );
+        runner.tools_enabled = self.agent_mode;
+        runner.permission_mode = self.config.permission_mode;
+
+        if let Err(e) = runner.execute_turn(&mut self.messages).await {
+            println!("\n{} {}", "✖ 请求或执行失败:".red().bold(), e);
+            self.messages.pop();
+        }
+
+        if runner.permission_mode != self.config.permission_mode {
+            self.config.permission_mode = runner.permission_mode;
+            let _ = self.config.save();
+        }
+    }
+
     async fn handle_chat(&mut self, query: &str) {
+        if let Some((img_path, remaining)) = crate::image::detect_image_in_prompt(query) {
+            println!("{} 检测到输入中包含图片路径: {}", "📷".cyan(), img_path.display().to_string().yellow());
+            match crate::image::load_image_file(&img_path) {
+                Ok((mime, b64)) => {
+                    let text = if remaining.trim().is_empty() {
+                        "请详细分析并描述这张图片。".to_string()
+                    } else {
+                        remaining
+                    };
+                    self.dispatch_image_turn(&text, &mime, &b64).await;
+                    return;
+                }
+                Err(e) => {
+                    println!("{} 读取图片失败: {}", "✖".red(), e);
+                }
+            }
+        }
+
         self.messages.push(ChatMessage::user(query));
 
         let model_name = crate::models_catalog::find_official_model(&self.current_model)
@@ -618,6 +729,7 @@ impl ReplSession {
         println!("  {:<26} 查看后台任务实时日志输出", "/logs <id> [lines]".yellow());
         println!("  {:<26} 查看已挂载的 MCP 外部服务与工具", "/mcp".yellow());
         println!("  {:<26} 清空当前会话上下文", "/clear, /c".yellow());
+        println!("  {:<26} 粘贴分析系统剪贴板截图或指定图片 (/image [path|问题])", "/image, /img".yellow());
         println!("  {:<26} 查看当前会话轮数及信息", "/history".yellow());
         println!("  {:<26} 查看或修改系统提示词", "/system [prompt]".yellow());
         println!("  {:<26} 查看当前配置信息", "/config".yellow());

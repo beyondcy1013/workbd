@@ -1,10 +1,33 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum ContentPart {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlDef },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageUrlDef {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -19,7 +42,7 @@ impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -30,7 +53,30 @@ impl ChatMessage {
     pub fn user(content: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    pub fn user_with_image(text: impl Into<String>, mime_type: &str, base64_data: &str) -> Self {
+        let data_url = format!("data:{};base64,{}", mime_type, base64_data);
+        let parts = vec![
+            ContentPart::Text {
+                text: text.into(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrlDef {
+                    url: data_url,
+                    detail: Some("auto".to_string()),
+                },
+            },
+        ];
+        Self {
+            role: "user".into(),
+            content: Some(MessageContent::Parts(parts)),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -45,7 +91,7 @@ impl ChatMessage {
     ) -> Self {
         Self {
             role: "assistant".into(),
-            content,
+            content: content.map(MessageContent::Text),
             reasoning_content: reasoning,
             tool_calls,
             tool_call_id: None,
@@ -56,12 +102,31 @@ impl ChatMessage {
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".into(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             name: None,
         }
+    }
+
+    pub fn text_content(&self) -> &str {
+        match &self.content {
+            Some(MessageContent::Text(s)) => s,
+            Some(MessageContent::Parts(parts)) => {
+                for p in parts {
+                    if let ContentPart::Text { text } = p {
+                        return text;
+                    }
+                }
+                ""
+            }
+            None => "",
+        }
+    }
+
+    pub fn set_text_content(&mut self, text: impl Into<String>) {
+        self.content = Some(MessageContent::Text(text.into()));
     }
 }
 

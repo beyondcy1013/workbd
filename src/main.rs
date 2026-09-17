@@ -4,6 +4,7 @@ mod client;
 mod compaction;
 mod config;
 mod diff;
+mod image;
 mod mcp;
 mod models_catalog;
 mod oauth;
@@ -85,6 +86,10 @@ struct Cli {
     /// 发起 OAuth 设备授权登录（cn: 国内版, global: 国际版）
     #[arg(long, value_name = "REALM")]
     login: Option<Option<String>>,
+
+    /// 附加分析本地图片或剪贴板图片（路径或 clipboard）
+    #[arg(long, value_name = "IMAGE_PATH")]
+    image: Option<String>,
 
     /// 列出所有可用模型并退出
     #[arg(short = 'l', long)]
@@ -221,7 +226,51 @@ async fn main() {
             }
         }
 
-        messages.push(ChatMessage::user(prompt));
+        // 检测或载入图片
+        let mut image_data = None;
+        let mut final_prompt = prompt.clone();
+
+        if let Some(ref img_arg) = cli.image {
+            let res = if img_arg == "clipboard" || img_arg == "paste" {
+                image::get_clipboard_image()
+            } else {
+                image::load_image_file(std::path::Path::new(img_arg))
+            };
+            match res {
+                Ok(data) => image_data = Some(data),
+                Err(e) => {
+                    eprintln!("{} 载入图片失败: {}", "✖".red(), e);
+                    std::process::exit(1);
+                }
+            }
+        } else if let Some((img_path, remaining)) = image::detect_image_in_prompt(&prompt) {
+            match image::load_image_file(&img_path) {
+                Ok(data) => {
+                    println!("{} 检测到图片路径: {}", "📷".cyan(), img_path.display().to_string().yellow());
+                    image_data = Some(data);
+                    if !remaining.trim().is_empty() {
+                        final_prompt = remaining;
+                    }
+                }
+                Err(e) => eprintln!("{} 读取图片失败: {}", "⚠".yellow(), e),
+            }
+        }
+
+        if let Some((mime, b64)) = image_data {
+            if !image::is_vision_model(&config.default_model) {
+                let rec = image::recommended_vision_model();
+                println!(
+                    "{} 当前模型 {} 不支持多模态视觉，已自动切换为推荐视觉模型: {}",
+                    "ℹ".blue().bold(),
+                    config.default_model.yellow(),
+                    rec.green().bold()
+                );
+                config.default_model = rec.to_string();
+            }
+            messages.push(ChatMessage::user_with_image(&final_prompt, &mime, &b64));
+        } else {
+            messages.push(ChatMessage::user(&final_prompt));
+        }
 
         let mut runner = AgentRunner::new(
             client,
