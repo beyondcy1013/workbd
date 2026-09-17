@@ -1,7 +1,7 @@
 use crate::types::{FunctionDefinition, ToolDefinition};
 use serde_json::{json, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -132,6 +132,40 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 }),
             },
         },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "load_skill".to_string(),
+                description: "Load a Codex / System skill by name to retrieve its full guidelines, documentation, and associated scripts paths.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "The exact name or keyword of the skill to load (e.g. 'webclx-compile-and-deploy', 'codex-db-maintenance')."
+                        }
+                    },
+                    "required": ["name"]
+                }),
+            },
+        },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "search_skills".to_string(),
+                description: "Search across the 720+ system and offline skills library by keyword.".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Keyword to search for across skill names and descriptions."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        },
     ]
 }
 
@@ -142,6 +176,20 @@ pub async fn execute_tool(name: &str, args_json: &str) -> String {
     };
 
     match name {
+        "load_skill" => {
+            let skill_name = match args.get("name").and_then(|v| v.as_str()) {
+                Some(n) => n,
+                None => return "错误: 缺少必填参数 name".to_string(),
+            };
+            run_load_skill(skill_name)
+        }
+        "search_skills" => {
+            let query = match args.get("query").and_then(|v| v.as_str()) {
+                Some(q) => q,
+                None => return "错误: 缺少必填参数 query".to_string(),
+            };
+            run_search_skills(query)
+        }
         "bash" => {
             let cmd = match args.get("command").and_then(|v| v.as_str()) {
                 Some(c) => c,
@@ -365,4 +413,30 @@ fn run_search_code(query: &str, path: &str) -> String {
     }
 
     format!("在 '{}' 中未搜索到包含 '{}' 的内容", path, query)
+}
+
+fn run_load_skill(name: &str) -> String {
+    let reg = crate::skills::SkillRegistry::default();
+    if let Some(skill) = reg.find_skill(name) {
+        match reg.load_skill_markdown(&skill) {
+            Ok(md) => md,
+            Err(e) => format!("加载技能失败: {}", e),
+        }
+    } else {
+        format!("未找到名为 '{}' 的技能。请使用 search_skills 搜索全量离线技能库或检查技能名称拼写。", name)
+    }
+}
+
+fn run_search_skills(query: &str) -> String {
+    let reg = crate::skills::SkillRegistry::default();
+    let matches = reg.search_all_skills(query);
+    if matches.is_empty() {
+        return format!("在系统和离线技能库中未搜索到包含 '{}' 的技能", query);
+    }
+
+    let mut out = format!("找到 {} 个匹配的技能 (显示前 15 个):\n", matches.len());
+    for s in matches.iter().take(15) {
+        out.push_str(&format!("- **{}** ({}): {}\n", s.name, s.category, s.description));
+    }
+    out
 }

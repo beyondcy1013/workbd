@@ -1,7 +1,6 @@
 use colored::*;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;

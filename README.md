@@ -20,6 +20,10 @@
 - **动态模型与域路由 (`/model`)**：
   - 支持 `/model` 实时查看全部模型；
   - 自动识别国内版（`cn:`）与国际版（`global:`）前缀，输入 `deepseek-v4.1-flash` 无感自动匹配。
+- **Codex & 系统技能库深度融合 (Codex Skills Integration)**：
+  - 零配置原生直接使用 Codex 技能（位于 `/home/root/.codex/skills` 与 `/home/codes/.agents/skills`）以及全量 720+ 离线技能库（`/home/codes/offlineSkills`）。
+  - 内置 `load_skill` 与 `search_skills` Agent 工具，大模型可在复杂开发任务中自主按需检索并加载技能规范与脚本。
+  - 支持交互命令 `/skills`、`/skill search <关键词>`、`/skill use <技能名>` 以及命令行参数 `--skill <名称>`。
 - **极速轻量**：仅约 6MB 单一原生二进制，冷启动 <10ms，内存占用仅约 15MB。
 - **双工作模式**：
   - 交互式 REPL：支持命令历史（上下键）、多轮上下文记忆、动态参数调整。
@@ -35,6 +39,10 @@
 | :--- | :--- | :--- |
 | `/agent [on\|off]` | - | 动态开启或关闭本地自主工具调用权限（默认开启） |
 | `/model [name]` | `/m` | 列出网关所有可用模型及价格，或指定切换至目标模型 |
+| `/skills` | `/skill list` | 查看所有已就绪的 Codex 与系统活跃技能 |
+| `/skill search <词>` | `/skill find` | 在 720+ 离线与系统技能库中模糊检索匹配的技能 |
+| `/skill use <name>` | `/skill load` | 加载指定技能文档及可调用的脚本至当前对话上下文 |
+| `/skill show <name>` | - | 直接在终端中查看指定技能的规范文档正文 |
 | `/login [realm]` | - | 发起 OAuth 设备流登录（`cn` 国内版 / `global` 国际版） |
 | `/clear` | `/c` | 清空当前对话与工具执行上下文，开始全新会话 |
 | `/history` | - | 查看当前会话累计上下文消息数与工具调用次数 |

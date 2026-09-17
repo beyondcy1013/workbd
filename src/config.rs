@@ -11,6 +11,10 @@ pub struct AppConfig {
     pub temperature: f32,
     #[serde(default = "default_true")]
     pub agent_mode: bool,
+    #[serde(default = "default_true")]
+    pub codex_skills: bool,
+    #[serde(default)]
+    pub custom_skills_dirs: Vec<PathBuf>,
 }
 
 fn default_true() -> bool {
@@ -23,9 +27,11 @@ impl Default for AppConfig {
             api_base: "http://127.0.0.1:7863/v1".to_string(),
             api_key: "LOCAL_TOKEN_CHANGE_ME".to_string(),
             default_model: "deepseek-v4.1-flash".to_string(),
-            system_prompt: "You are WorkBuddy Code, an expert autonomous AI software engineer. You have access to local workspace tools (bash, read_file, write_file, replace_in_file, list_dir, search_code). Always proactively inspect code, make changes, and verify with tests/builds via bash.".to_string(),
+            system_prompt: "You are WorkBuddy Code, an expert autonomous AI software engineer. You have access to local workspace tools (bash, read_file, write_file, replace_in_file, list_dir, search_code, load_skill, search_skills). Always proactively inspect code, make changes, and verify with tests/builds via bash.".to_string(),
             temperature: 0.5,
             agent_mode: true,
+            codex_skills: true,
+            custom_skills_dirs: Vec::new(),
         }
     }
 }
@@ -43,6 +49,16 @@ impl AppConfig {
 
     pub fn history_file_path() -> PathBuf {
         Self::config_dir().join("history.txt")
+    }
+
+    pub fn build_effective_system_prompt(&self) -> String {
+        let mut sys = self.system_prompt.clone();
+        if self.codex_skills {
+            let reg = crate::skills::SkillRegistry::new(self.custom_skills_dirs.clone());
+            let summary = reg.format_system_prompt_skills_summary();
+            sys.push_str(&summary);
+        }
+        sys
     }
 
     pub fn load() -> Self {

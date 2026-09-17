@@ -2,6 +2,7 @@ use crate::agent::AgentRunner;
 use crate::client::ApiClient;
 use crate::config::AppConfig;
 use crate::oauth::run_oauth_login;
+use crate::skills::SkillRegistry;
 use crate::types::ChatMessage;
 use colored::*;
 use rustyline::error::ReadlineError;
@@ -22,8 +23,9 @@ impl ReplSession {
         let current_model = config.default_model.clone();
         let agent_mode = config.agent_mode;
         let mut messages = Vec::new();
-        if !config.system_prompt.trim().is_empty() {
-            messages.push(ChatMessage::system(&config.system_prompt));
+        let effective_sys = config.build_effective_system_prompt();
+        if !effective_sys.trim().is_empty() {
+            messages.push(ChatMessage::system(&effective_sys));
         }
 
         Self {
@@ -124,6 +126,35 @@ impl ReplSession {
             }
             "/help" | "/h" | "/?" => {
                 self.print_help();
+            }
+            "/skills" => {
+                self.list_skills();
+            }
+            "/skill" => {
+                if args.is_empty() {
+                    self.list_skills();
+                } else {
+                    let sub = args[0];
+                    match sub {
+                        "list" => self.list_skills(),
+                        "search" | "find" => {
+                            let query = args[1..].join(" ");
+                            self.search_skills(&query);
+                        }
+                        "show" => {
+                            let name = args[1..].join(" ");
+                            self.show_skill(&name);
+                        }
+                        "use" | "load" => {
+                            let name = args[1..].join(" ");
+                            self.use_skill(&name);
+                        }
+                        _ => {
+                            let name = args.join(" ");
+                            self.use_skill(&name);
+                        }
+                    }
+                }
             }
             "/clear" | "/c" => {
                 self.messages.clear();
@@ -312,6 +343,114 @@ impl ReplSession {
         }
     }
 
+    fn list_skills(&self) {
+        let reg = SkillRegistry::default();
+        let active = reg.list_active_skills();
+
+        println!("{}", "── Codex & 系统活跃技能库 (Active Skills) ──".cyan().bold());
+        if active.is_empty() {
+            println!("  {}", "未发现活跃技能。可在 /home/root/.codex/skills 或 /home/codes/.agents/skills 放置 SKILL.md".dimmed());
+        } else {
+            for s in &active {
+                println!(
+                    "  {} {:<30} {}",
+                    "★".yellow(),
+                    s.name.green().bold(),
+                    s.description.dimmed()
+                );
+            }
+        }
+        println!(
+            "\n提示: 输入 {} 加载技能到当前上下文，或 {} 搜索 700+ 离线技能库。",
+            "/skill use <技能名>".bold(),
+            "/skill search <关键词>".bold()
+        );
+    }
+
+    fn search_skills(&self, query: &str) {
+        if query.trim().is_empty() {
+            println!("{} 请输入搜索关键词，例如: /skill search android 或 /skill search rust", "ℹ".blue());
+            return;
+        }
+
+        let reg = SkillRegistry::default();
+        let matches = reg.search_all_skills(query);
+
+        println!("{}", format!("── 技能检索结果 (关键词: \"{}\", 共 {} 个匹配) ──", query, matches.len()).cyan().bold());
+        if matches.is_empty() {
+            println!("  未找到匹配 \"{}\" 的技能。", query);
+            return;
+        }
+
+        for (idx, s) in matches.iter().take(20).enumerate() {
+            let cat_badge = if s.category == "active" {
+                "[活跃]".green()
+            } else {
+                "[离线]".blue()
+            };
+            println!(
+                "  {:>2}. {} {:<28} {}",
+                idx + 1,
+                cat_badge,
+                s.name.yellow().bold(),
+                s.description.dimmed()
+            );
+        }
+
+        if matches.len() > 20 {
+            println!("  ... 还有 {} 个结果被折叠，可缩窄关键词", matches.len() - 20);
+        }
+
+        println!("\n输入 {} 加载指定技能，或 {} 查看技能文档正文。", "/skill use <名称>".green(), "/skill show <名称>".cyan());
+    }
+
+    fn show_skill(&self, name: &str) {
+        let reg = SkillRegistry::default();
+        match reg.find_skill(name) {
+            Some(skill) => match reg.load_skill_markdown(&skill) {
+                Ok(content) => {
+                    println!("{}", format!("── 技能文档: {} ──", skill.name).cyan().bold());
+                    println!("{}", content);
+                }
+                Err(e) => println!("{} {}", "✖ 加载技能失败:".red(), e),
+            },
+            None => {
+                println!("{} 未找到名称为 \"{}\" 的技能。可使用 /skill search 搜索。", "✖".red(), name);
+            }
+        }
+    }
+
+    pub fn use_skill(&mut self, name: &str) {
+        let reg = SkillRegistry::default();
+        match reg.find_skill(name) {
+            Some(skill) => match reg.load_skill_markdown(&skill) {
+                Ok(content) => {
+                    let prompt_injection = format!(
+                        "【已载入技能规范: {}】\n\n{}\n\n请在接下来的对话与代码操作中严格遵循该技能的规范、指导原则和关联脚本路径。",
+                        skill.name, content
+                    );
+                    self.messages.push(ChatMessage::user(&prompt_injection));
+                    println!("✔ 技能 [{}] 已载入当前会话上下文！", skill.name.green().bold());
+                    println!("  描述: {}", skill.description.dimmed());
+                    println!("  路径: {}", skill.skill_dir.display().to_string().dimmed());
+                    let scripts_dir = skill.skill_dir.join("scripts");
+                    if scripts_dir.exists() {
+                        println!("  可调用的脚本:");
+                        if let Ok(entries) = std::fs::read_dir(&scripts_dir) {
+                            for e in entries.flatten() {
+                                println!("    - {}", e.path().display());
+                            }
+                        }
+                    }
+                }
+                Err(e) => println!("{} {}", "✖ 加载技能失败:".red(), e),
+            },
+            None => {
+                println!("{} 未找到名为 \"{}\" 的技能。可输入 /skills 查看可用技能，或 /skill search 搜索。", "✖".red(), name);
+            }
+        }
+    }
+
     pub fn print_help(&self) {
         println!("{}", "── WorkBuddy Code Agent 命令帮助 ──".cyan().bold());
         println!("  {:<26} 显示当前可用模型列表", "/model, /m".yellow());
@@ -320,6 +459,10 @@ impl ReplSession {
             "/model <name>".yellow()
         );
         println!("  {:<26} 开启/关闭 Agent 自主编程工具权限", "/agent [on|off]".yellow());
+        println!("  {:<26} 查看所有 Codex / 系统活跃技能", "/skills, /skill list".yellow());
+        println!("  {:<26} 检索 Codex 与 700+ 离线技能库", "/skill search <query>".yellow());
+        println!("  {:<26} 加载技能并注入到当前对话上下文", "/skill use <name>".yellow());
+        println!("  {:<26} 查看指定技能的完整文档正文", "/skill show <name>".yellow());
         println!("  {:<26} 发起 OAuth 设备授权登录 (支持 cn 或 global)", "/login [realm]".yellow());
         println!("  {:<26} 清空当前会话上下文", "/clear, /c".yellow());
         println!("  {:<26} 查看当前会话轮数及信息", "/history".yellow());

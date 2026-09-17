@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod oauth;
 mod repl;
+mod skills;
 mod tools;
 mod types;
 
@@ -13,6 +14,7 @@ use colored::*;
 use config::AppConfig;
 use oauth::run_oauth_login;
 use repl::ReplSession;
+use skills::SkillRegistry;
 use types::ChatMessage;
 
 #[derive(Parser, Debug)]
@@ -48,6 +50,22 @@ struct Cli {
     /// 禁用 Agent 工具调用权限（进入纯对话模式）
     #[arg(long)]
     no_agent: bool,
+
+    /// 预先载入并激活指定技能（支持 Codex 技能或离线技能）
+    #[arg(long, value_name = "SKILL_NAME")]
+    skill: Option<String>,
+
+    /// 列出所有可用的 Codex / 系统技能并退出
+    #[arg(long)]
+    list_skills: bool,
+
+    /// 检索 Codex 与 700+ 离线技能库
+    #[arg(long, value_name = "QUERY")]
+    search_skills: Option<String>,
+
+    /// 禁用自动注入技能清单到系统提示词中
+    #[arg(long)]
+    no_skills: bool,
 
     /// 发起 OAuth 设备授权登录（cn: 国内版, global: 国际版）
     #[arg(long, value_name = "REALM")]
@@ -94,6 +112,43 @@ async fn main() {
     if cli.no_agent {
         config.agent_mode = false;
     }
+    if cli.no_skills {
+        config.codex_skills = false;
+    }
+
+    // 处理技能列表
+    if cli.list_skills {
+        let reg = SkillRegistry::default();
+        let active = reg.list_active_skills();
+        println!("{}", "── Codex & 系统活跃技能库 (Active Skills) ──".cyan().bold());
+        if active.is_empty() {
+            println!("  未在 /home/root/.codex/skills 或 /home/codes/.agents/skills 发现活跃技能。");
+        } else {
+            for s in active {
+                println!("  {} {:<30} {}", "★".yellow(), s.name.green().bold(), s.description.dimmed());
+            }
+        }
+        return;
+    }
+
+    // 处理技能检索
+    if let Some(ref query) = cli.search_skills {
+        let reg = SkillRegistry::default();
+        let matches = reg.search_all_skills(query);
+        println!("{}", format!("── 技能检索结果 (关键词: \"{}\", 共 {} 个匹配) ──", query, matches.len()).cyan().bold());
+        if matches.is_empty() {
+            println!("  未找到匹配 \"{}\" 的技能。", query);
+        } else {
+            for (idx, s) in matches.iter().take(25).enumerate() {
+                let badge = if s.category == "active" { "[活跃]".green() } else { "[离线]".blue() };
+                println!("  {:>2}. {} {:<28} {}", idx + 1, badge, s.name.yellow().bold(), s.description.dimmed());
+            }
+            if matches.len() > 25 {
+                println!("  ... 还有 {} 个匹配结果被折叠", matches.len() - 25);
+            }
+        }
+        return;
+    }
 
     let client = ApiClient::new(&config.api_base, &config.api_key);
 
@@ -130,9 +185,29 @@ async fn main() {
     // 单次任务执行模式 (Agent Runner)
     if let Some(prompt) = cli.prompt {
         let mut messages = Vec::new();
-        if !config.system_prompt.trim().is_empty() {
-            messages.push(ChatMessage::system(&config.system_prompt));
+        let effective_sys = config.build_effective_system_prompt();
+        if !effective_sys.trim().is_empty() {
+            messages.push(ChatMessage::system(&effective_sys));
         }
+
+        // 预载技能（如果有指定）
+        if let Some(ref skill_name) = cli.skill {
+            let reg = SkillRegistry::default();
+            match reg.find_skill(skill_name) {
+                Some(skill) => match reg.load_skill_markdown(&skill) {
+                    Ok(content) => {
+                        println!("✔ 已预载技能: {}", skill.name.green().bold());
+                        messages.push(ChatMessage::user(&format!(
+                            "【已载入技能规范: {}】\n\n{}\n\n请在接下来的任务执行中遵循此技能要求。",
+                            skill.name, content
+                        )));
+                    }
+                    Err(e) => eprintln!("{} 载入技能失败: {}", "⚠".yellow(), e),
+                },
+                None => eprintln!("{} 未找到指定技能 \"{}\"", "⚠".yellow(), skill_name),
+            }
+        }
+
         messages.push(ChatMessage::user(prompt));
 
         let mut runner = AgentRunner::new(
@@ -151,5 +226,8 @@ async fn main() {
 
     // 交互式 REPL 模式
     let mut session = ReplSession::new(config);
+    if let Some(ref skill_name) = cli.skill {
+        session.use_skill(skill_name);
+    }
     session.run().await;
 }
