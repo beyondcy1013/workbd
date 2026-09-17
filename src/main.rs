@@ -1,10 +1,16 @@
 mod agent;
+mod checkpoint;
 mod client;
+mod compaction;
 mod config;
+mod diff;
+mod mcp;
 mod models_catalog;
 mod oauth;
 mod repl;
 mod skills;
+mod subagent;
+mod task_manager;
 mod tools;
 mod types;
 
@@ -185,6 +191,9 @@ async fn main() {
         }
         return;
     }
+
+    // 自动发现并挂载外部 MCP 扩展服务
+    crate::tools::get_mcp_registry().auto_load().await;
 
     // 单次任务执行模式 (Agent Runner)
     if let Some(prompt) = cli.prompt {

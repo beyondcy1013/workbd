@@ -1,9 +1,35 @@
+use crate::checkpoint::{CheckpointManager, SharedCheckpointManager};
+use crate::mcp::McpRegistry;
+use crate::task_manager::{SharedTaskManager, TaskManager};
 use crate::types::{FunctionDefinition, ToolDefinition};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+static GLOBAL_CHECKPOINT_MGR: OnceLock<SharedCheckpointManager> = OnceLock::new();
+static GLOBAL_TASK_MGR: OnceLock<SharedTaskManager> = OnceLock::new();
+static GLOBAL_MCP_REGISTRY: OnceLock<Arc<McpRegistry>> = OnceLock::new();
+
+pub fn get_checkpoint_manager() -> SharedCheckpointManager {
+    GLOBAL_CHECKPOINT_MGR
+        .get_or_init(CheckpointManager::new_shared)
+        .clone()
+}
+
+pub fn get_task_manager() -> SharedTaskManager {
+    GLOBAL_TASK_MGR
+        .get_or_init(TaskManager::new)
+        .clone()
+}
+
+pub fn get_mcp_registry() -> Arc<McpRegistry> {
+    GLOBAL_MCP_REGISTRY
+        .get_or_init(|| Arc::new(McpRegistry::new()))
+        .clone()
+}
 
 pub fn all_tools() -> Vec<ToolDefinition> {
     vec![
@@ -11,19 +37,50 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "bash".to_string(),
-                description: "Execute a shell/bash command in the current workspace and return stdout, stderr, and exit status. Use this to compile code, run tests, install packages, check git, or inspect system state.".to_string(),
+                description: "Execute a shell/bash command in the current workspace and return stdout, stderr, and exit status. Supports foreground command execution or background daemon tasks (is_background=true).".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "command": {
                             "type": "string",
                             "description": "The command line string to execute."
+                        },
+                        "is_background": {
+                            "type": "boolean",
+                            "description": "Set to true to launch as a persistent background daemon task."
                         }
                     },
                     "required": ["command"]
                 }),
             },
         },
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "manage_task".to_string(),
+                description: "Inspect or manage background tasks launched via bash (actions: 'list', 'logs', 'kill').".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["list", "logs", "kill"],
+                            "description": "The action to perform: 'list' (show all tasks), 'logs' (tail output), 'kill' (stop task)."
+                        },
+                        "task_id": {
+                            "type": "string",
+                            "description": "The task ID to query or kill (e.g. 'task-1'). Required for 'logs' and 'kill'."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Number of recent log lines to retrieve (default 50)."
+                        }
+                    },
+                    "required": ["action"]
+                }),
+            },
+        },
+        crate::subagent::delegate_tool_definition(),
         ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
@@ -53,7 +110,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "write_file".to_string(),
-                description: "Create a new file or completely overwrite an existing file with the specified content.".to_string(),
+                description: "Create a new file or completely overwrite an existing file with the specified content. Automatically generates a colored diff and records a snapshot checkpoint for rollback.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -74,7 +131,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: "replace_in_file".to_string(),
-                description: "Replace exact target string with replacement string in an existing file. This is preferred over rewriting entire large files.".to_string(),
+                description: "Replace exact target string with replacement string in an existing file. Automatically generates a colored diff and records a snapshot checkpoint for rollback.".to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -169,13 +226,63 @@ pub fn all_tools() -> Vec<ToolDefinition> {
     ]
 }
 
-pub async fn execute_tool(name: &str, args_json: &str) -> String {
+pub async fn execute_tool(
+    name: &str,
+    args_json: &str,
+    client: Option<&crate::client::ApiClient>,
+    model: Option<&str>,
+) -> String {
     let args: Value = match serde_json::from_str(args_json) {
         Ok(v) => v,
         Err(e) => return format!("错误: 参数 JSON 解析失败: {}", e),
     };
 
+    // 优先检查是否为 MCP 外部工具
+    if name.starts_with("mcp__") {
+        let mcp = get_mcp_registry();
+        if let Some(res) = mcp.call_tool(name, args_json).await {
+            return res;
+        }
+    }
+
     match name {
+        "bash" => {
+            let cmd = match args.get("command").and_then(|v| v.as_str()) {
+                Some(c) => c,
+                None => return "错误: 缺少必填参数 command".to_string(),
+            };
+            let is_bg = args.get("is_background").and_then(|v| v.as_bool()).unwrap_or(false);
+            run_bash(cmd, is_bg).await
+        }
+        "manage_task" => {
+            let action = match args.get("action").and_then(|v| v.as_str()) {
+                Some(a) => a,
+                None => return "错误: 缺少必填参数 action".to_string(),
+            };
+            let task_id = args.get("task_id").and_then(|v| v.as_str());
+            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+            run_manage_task(action, task_id, limit).await
+        }
+        "delegate_task" => {
+            let role = match args.get("role").and_then(|v| v.as_str()) {
+                Some(r) => r,
+                None => "explorer",
+            };
+            let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
+                Some(p) => p,
+                None => return "错误: 缺少必填参数 prompt".to_string(),
+            };
+            match (client, model) {
+                (Some(c), Some(m)) => {
+                    let runner = crate::subagent::SubagentRunner::new(c.clone(), m.to_string(), role);
+                    match runner.run_task(prompt).await {
+                        Ok(res) => format!("── 子智能体 [{}] 汇报完成 ──\n{}", role, res),
+                        Err(e) => format!("子智能体执行失败: {}", e),
+                    }
+                }
+                _ => "错误: 当前环境缺少 ApiClient 或模型配置，无法派发子智能体".to_string(),
+            }
+        }
         "load_skill" => {
             let skill_name = match args.get("name").and_then(|v| v.as_str()) {
                 Some(n) => n,
@@ -189,13 +296,6 @@ pub async fn execute_tool(name: &str, args_json: &str) -> String {
                 None => return "错误: 缺少必填参数 query".to_string(),
             };
             run_search_skills(query)
-        }
-        "bash" => {
-            let cmd = match args.get("command").and_then(|v| v.as_str()) {
-                Some(c) => c,
-                None => return "错误: 缺少必填参数 command".to_string(),
-            };
-            run_bash(cmd).await
         }
         "read_file" => {
             let path = match args.get("path").and_then(|v| v.as_str()) {
@@ -248,41 +348,91 @@ pub async fn execute_tool(name: &str, args_json: &str) -> String {
     }
 }
 
-async fn run_bash(command: &str) -> String {
-    let output = match tokio::time::timeout(
-        Duration::from_secs(120),
-        tokio::process::Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .output(),
-    )
-    .await
-    {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => return format!("执行命令失败: {}", e),
-        Err(_) => return "命令执行超时 (120 秒)".to_string(),
-    };
-
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    let mut result = format!("[退出码: {}]\n", exit_code);
-    if !stdout.trim().is_empty() {
-        result.push_str(&format!("--- 标准输出 (stdout) ---\n{}\n", stdout));
-    }
-    if !stderr.trim().is_empty() {
-        result.push_str(&format!("--- 错误输出 (stderr) ---\n{}\n", stderr));
-    }
-    if stdout.trim().is_empty() && stderr.trim().is_empty() {
-        result.push_str("(无输出)\n");
-    }
-
-    // 限制最大长度避免打爆上下文 (最大 16000 字符)
-    if result.len() > 16000 {
-        format!("{}\n... (输出已截断，共 {} 字符)", &result[..16000], result.len())
+async fn run_bash(command: &str, is_background: bool) -> String {
+    if is_background {
+        match get_task_manager().spawn_task(command).await {
+            Ok(task_id) => {
+                format!(
+                    "✔ 已将命令放入后台作为守护进程启动 (Task ID: {})\n提示: 可使用 manage_task 工具或 /tasks 命令监控或终止该任务。",
+                    task_id
+                )
+            }
+            Err(e) => format!("启动后台守护任务失败: {}", e),
+        }
     } else {
-        result
+        let output = match tokio::time::timeout(
+            Duration::from_secs(120),
+            tokio::process::Command::new("bash")
+                .arg("-c")
+                .arg(command)
+                .output(),
+        )
+        .await
+        {
+            Ok(Ok(out)) => out,
+            Ok(Err(e)) => return format!("执行命令失败: {}", e),
+            Err(_) => return "命令执行超时 (120 秒)".to_string(),
+        };
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        let mut result = format!("[退出码: {}]\n", exit_code);
+        if !stdout.trim().is_empty() {
+            result.push_str(&format!("--- 标准输出 (stdout) ---\n{}\n", stdout));
+        }
+        if !stderr.trim().is_empty() {
+            result.push_str(&format!("--- 错误输出 (stderr) ---\n{}\n", stderr));
+        }
+        if stdout.trim().is_empty() && stderr.trim().is_empty() {
+            result.push_str("(无输出)\n");
+        }
+
+        if result.len() > 16000 {
+            format!("{}\n... (输出已截断，共 {} 字符)", &result[..16000], result.len())
+        } else {
+            result
+        }
+    }
+}
+
+async fn run_manage_task(action: &str, task_id: Option<&str>, limit: Option<usize>) -> String {
+    let tm = get_task_manager();
+    match action.to_lowercase().as_str() {
+        "list" | "ls" => {
+            let tasks = tm.list_tasks();
+            if tasks.is_empty() {
+                "当前没有后台运行中的任务。".to_string()
+            } else {
+                let mut out = String::from("── 当前后台任务清单 ──\n");
+                for (id, cmd, status, started) in tasks {
+                    out.push_str(&format!("  {} [{}] {} (启动时间: {})\n", id, status, cmd, started));
+                }
+                out
+            }
+        }
+        "logs" | "log" | "output" => {
+            let id = match task_id {
+                Some(id) => id,
+                None => return "错误: 查询日志必须提供 task_id".to_string(),
+            };
+            match tm.get_logs(id, limit) {
+                Ok(logs) => format!("── 任务 {} 最近输出 ──\n{}", id, logs),
+                Err(e) => e,
+            }
+        }
+        "kill" | "stop" | "cancel" => {
+            let id = match task_id {
+                Some(id) => id,
+                None => return "错误: 终止任务必须提供 task_id".to_string(),
+            };
+            match tm.kill_task(id).await {
+                Ok(msg) => msg,
+                Err(e) => e,
+            }
+        }
+        _ => format!("未知 manage_task 动作: '{}', 可选: list, logs, kill", action),
     }
 }
 
@@ -312,6 +462,9 @@ fn run_read_file(path: &str, start_line: Option<usize>, end_line: Option<usize>)
 
 fn run_write_file(path: &str, content: &str) -> String {
     let p = Path::new(path);
+    let old_content = fs::read_to_string(p).ok();
+    let diff_stats = crate::diff::compute_diff(path, old_content.as_deref().unwrap_or(""), content);
+
     if let Some(parent) = p.parent() {
         if !parent.exists() {
             if let Err(e) = fs::create_dir_all(parent) {
@@ -321,13 +474,29 @@ fn run_write_file(path: &str, content: &str) -> String {
     }
 
     match fs::write(path, content) {
-        Ok(_) => format!("成功写入文件 '{}' ({} 字节)", path, content.len()),
+        Ok(_) => {
+            get_checkpoint_manager().lock().unwrap().record_file_change(
+                p,
+                old_content,
+                Some(content.to_string()),
+                &format!("write_file: {}", path),
+            );
+            format!(
+                "成功写入文件 '{}' ({} 字节, +{} -{} 行)\n{}",
+                path,
+                content.len(),
+                diff_stats.added,
+                diff_stats.deleted,
+                diff_stats.colored_diff
+            )
+        }
         Err(e) => format!("写入文件失败 '{}': {}", path, e),
     }
 }
 
 fn run_replace_in_file(path: &str, target_content: &str, replacement_content: &str) -> String {
-    let content = match fs::read_to_string(path) {
+    let p = Path::new(path);
+    let content = match fs::read_to_string(p) {
         Ok(c) => c,
         Err(e) => return format!("读取文件失败 '{}': {}", path, e),
     };
@@ -338,23 +507,46 @@ fn run_replace_in_file(path: &str, target_content: &str, replacement_content: &s
 
     let count = content.matches(target_content).count();
     let new_content = content.replacen(target_content, replacement_content, 1);
+    let diff_stats = crate::diff::compute_diff(path, &content, &new_content);
 
-    match fs::write(path, new_content) {
+    match fs::write(path, &new_content) {
         Ok(_) => {
-            if count > 1 {
-                format!("成功替换文件 '{}' 中的第 1 处匹配（共找到 {} 处匹配）", path, count)
+            get_checkpoint_manager().lock().unwrap().record_file_change(
+                p,
+                Some(content),
+                Some(new_content),
+                &format!("replace_in_file: {}", path),
+            );
+            let match_info = if count > 1 {
+                format!("（共找到 {} 处匹配，已替换第 1 处）", count)
             } else {
-                format!("成功在文件 '{}' 中完成精确替换", path)
-            }
+                String::new()
+            };
+            format!(
+                "成功在文件 '{}' 中完成精确替换 {} (+{} -{} 行)\n{}",
+                path,
+                match_info,
+                diff_stats.added,
+                diff_stats.deleted,
+                diff_stats.colored_diff
+            )
         }
         Err(e) => format!("写入文件失败 '{}': {}", path, e),
     }
 }
 
 fn run_list_dir(path: &str) -> String {
-    let entries = match fs::read_dir(path) {
+    let p = Path::new(path);
+    if !p.exists() {
+        return format!("目录不存在: '{}'", path);
+    }
+    if !p.is_dir() {
+        return format!("路径不是一个目录: '{}'", path);
+    }
+
+    let entries = match fs::read_dir(p) {
         Ok(e) => e,
-        Err(e) => return format!("读取目录失败 '{}': {}", path, e),
+        Err(err) => return format!("无法读取目录 '{}': {}", path, err),
     };
 
     let mut dirs = Vec::new();
@@ -362,68 +554,82 @@ fn run_list_dir(path: &str) -> String {
 
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && name != "." {
-            continue;
-        }
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_dir() {
-                dirs.push(format!("📁 {}/", name));
+        if let Ok(file_type) = entry.file_type() {
+            if file_type.is_dir() {
+                dirs.push(name);
             } else {
-                files.push(format!("📄 {:<32} ({} B)", name, meta.len()));
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                files.push((name, size));
             }
         }
     }
 
     dirs.sort();
-    files.sort();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut out = format!("目录: {}\n", path);
+    let mut result = format!("目录列表: '{}' ({} 目录, {} 文件):\n", path, dirs.len(), files.len());
     for d in dirs {
-        out.push_str(&format!("  {}\n", d));
+        result.push_str(&format!("  [目录] {}/\n", d));
     }
-    for f in files {
-        out.push_str(&format!("  {}\n", f));
+    for (f, size) in files {
+        result.push_str(&format!("  [文件] {:<30} ({} 字节)\n", f, size));
     }
-    out
+
+    result
 }
 
 fn run_search_code(query: &str, path: &str) -> String {
-    // 优先尝试 ripgrep
-    let out = Command::new("rg")
-        .args(["--line-number", "--max-count", "20", "--max-columns", "200", query, path])
+    let rg_output = Command::new("rg")
+        .arg("-n")
+        .arg("--max-count")
+        .arg("50")
+        .arg(query)
+        .arg(path)
         .output();
 
-    if let Ok(output) = out {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            return format!("搜索结果 (rg):\n{}", stdout);
+    match rg_output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if !stdout.trim().is_empty() {
+                if stdout.len() > 10000 {
+                    format!("{}\n... (搜索结果已截断)", &stdout[..10000])
+                } else {
+                    stdout.to_string()
+                }
+            } else {
+                format!("在 '{}' 中未搜索到匹配 '{}' 的代码", path, query)
+            }
+        }
+        Err(_) => {
+            let grep_output = Command::new("grep")
+                .arg("-rn")
+                .arg(query)
+                .arg(path)
+                .output();
+
+            match grep_output {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if !stdout.trim().is_empty() {
+                        stdout.to_string()
+                    } else {
+                        format!("未搜索到匹配 '{}' 的代码", query)
+                    }
+                }
+                Err(e) => format!("搜索代码失败: {}", e),
+            }
         }
     }
-
-    // 回落 grep
-    let out = Command::new("grep")
-        .args(["-rn", "-m", "20", query, path])
-        .output();
-
-    if let Ok(output) = out {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.trim().is_empty() {
-            return format!("搜索结果 (grep):\n{}", stdout);
-        }
-    }
-
-    format!("在 '{}' 中未搜索到包含 '{}' 的内容", path, query)
 }
 
 fn run_load_skill(name: &str) -> String {
     let reg = crate::skills::SkillRegistry::default();
-    if let Some(skill) = reg.find_skill(name) {
-        match reg.load_skill_markdown(&skill) {
-            Ok(md) => md,
+    match reg.find_skill(name) {
+        Some(skill) => match reg.load_skill_markdown(&skill) {
+            Ok(doc) => doc,
             Err(e) => format!("加载技能失败: {}", e),
-        }
-    } else {
-        format!("未找到名为 '{}' 的技能。请使用 search_skills 搜索全量离线技能库或检查技能名称拼写。", name)
+        },
+        None => format!("未在活跃或离线技能库中找到名称为 '{}' 的技能。请使用 search_skills 检索。", name),
     }
 }
 
@@ -431,12 +637,17 @@ fn run_search_skills(query: &str) -> String {
     let reg = crate::skills::SkillRegistry::default();
     let matches = reg.search_all_skills(query);
     if matches.is_empty() {
-        return format!("在系统和离线技能库中未搜索到包含 '{}' 的技能", query);
+        return format!("在技能库中未搜索到匹配 '{}' 的技能。", query);
     }
 
-    let mut out = format!("找到 {} 个匹配的技能 (显示前 15 个):\n", matches.len());
-    for s in matches.iter().take(15) {
-        out.push_str(&format!("- **{}** ({}): {}\n", s.name, s.category, s.description));
+    let mut out = format!("找到 {} 个匹配技能 (关键词: \"{}\"):\n", matches.len(), query);
+    for (idx, s) in matches.iter().take(20).enumerate() {
+        let cat = if s.category == "active" { "[活跃]" } else { "[离线]" };
+        out.push_str(&format!("{}. {} {:<24} {}\n", idx + 1, cat, s.name, s.description));
     }
+    if matches.len() > 20 {
+        out.push_str(&format!("... 还有 {} 个匹配结果被省略\n", matches.len() - 20));
+    }
+    out.push_str("\n提示: 可调用 load_skill 加载所需技能的详细使用文档。");
     out
 }

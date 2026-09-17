@@ -28,8 +28,16 @@ impl AgentRunner {
     }
 
     pub async fn execute_turn(&mut self, messages: &mut Vec<ChatMessage>) -> Result<(), String> {
+        // 自动上下文压缩修剪检测 (超过 16 轮或估算超过 24000 Tokens)
+        if crate::compaction::should_compact(messages, 24000, 16) {
+            crate::compaction::compact_context(messages);
+        }
+
         let tools = if self.tools_enabled {
-            Some(all_tools())
+            let mut t = all_tools();
+            let mcp_tools = crate::tools::get_mcp_registry().all_mcp_tools().await;
+            t.extend(mcp_tools);
+            Some(t)
         } else {
             None
         };
@@ -173,6 +181,12 @@ impl AgentRunner {
                         tool_name.cyan().bold(),
                         preview.white()
                     );
+
+                    // 如果是文件修改工具，预先展示彩色 Diff 审查
+                    if let Some(diff_preview) = compute_tool_diff_preview(tool_name, &call.function.arguments) {
+                        println!("{}\n{}", "── 代码变更预览 (Diff Review) ──".cyan().bold(), diff_preview);
+                    }
+
                     print!(
                         "{} 是否允许执行此工具? [y: 允许 / n: 拒绝 / a: 允许后续所有]: ",
                         "?".yellow().bold()
@@ -211,7 +225,13 @@ impl AgentRunner {
                 }
 
                 let start_time = std::time::Instant::now();
-                let output = execute_tool(tool_name, &call.function.arguments).await;
+                let output = execute_tool(
+                    tool_name,
+                    &call.function.arguments,
+                    Some(&self.client),
+                    Some(&self.model),
+                )
+                .await;
                 let elapsed = start_time.elapsed().as_millis();
 
                 let line_count = output.lines().count();
@@ -233,13 +253,53 @@ impl AgentRunner {
     }
 }
 
+fn compute_tool_diff_preview(tool_name: &str, args_json: &str) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(args_json).ok()?;
+    match tool_name {
+        "write_file" => {
+            let path = args.get("path")?.as_str()?;
+            let content = args.get("content")?.as_str()?;
+            let old_content = std::fs::read_to_string(path).unwrap_or_default();
+            let diff = crate::diff::compute_diff(path, &old_content, content);
+            Some(diff.colored_diff)
+        }
+        "replace_in_file" => {
+            let path = args.get("path")?.as_str()?;
+            let target = args.get("target_content")?.as_str()?;
+            let replacement = args.get("replacement_content")?.as_str()?;
+            let old_content = std::fs::read_to_string(path).ok()?;
+            if !old_content.contains(target) {
+                return None;
+            }
+            let new_content = old_content.replacen(target, replacement, 1);
+            let diff = crate::diff::compute_diff(path, &old_content, &new_content);
+            Some(diff.colored_diff)
+        }
+        _ => None,
+    }
+}
+
 fn format_tool_preview(tool_name: &str, args_json: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) {
         match tool_name {
             "bash" => {
-                if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                let is_bg = v.get("is_background").and_then(|b| b.as_bool()).unwrap_or(false);
+                if is_bg {
+                    return format!("后台守护命令: {}", cmd);
+                } else {
                     return format!("执行终端命令: {}", cmd);
                 }
+            }
+            "manage_task" => {
+                let act = v.get("action").and_then(|a| a.as_str()).unwrap_or("list");
+                let tid = v.get("task_id").and_then(|t| t.as_str()).unwrap_or("");
+                return format!("管理后台任务: {} {}", act, tid);
+            }
+            "delegate_task" => {
+                let role = v.get("role").and_then(|r| r.as_str()).unwrap_or("explorer");
+                let prompt = v.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                return format!("委派子智能体 [{}]: {}", role, prompt);
             }
             "write_file" => {
                 if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
@@ -276,7 +336,11 @@ fn format_tool_preview(tool_name: &str, args_json: &str) -> String {
                     return format!("检索技能库: \"{}\"", q);
                 }
             }
-            _ => {}
+            _ => {
+                if tool_name.starts_with("mcp__") {
+                    return format!("外部 MCP 工具: {}", tool_name);
+                }
+            }
         }
     }
     if args_json.len() > 100 {

@@ -220,6 +220,75 @@ impl ReplSession {
                     println!("{} {}", "✖ 登录出错:".red().bold(), e);
                 }
             }
+            "/undo" => {
+                let res = crate::tools::get_checkpoint_manager().lock().unwrap().undo_last();
+                match res {
+                    Ok(msg) => {
+                        println!("{}", msg);
+                        while let Some(last) = self.messages.last() {
+                            if last.role == "tool" || (last.role == "assistant" && last.tool_calls.is_some()) {
+                                self.messages.pop();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => println!("{} {}", "✖ 回滚失败:".red().bold(), e),
+                }
+            }
+            "/compact" | "/summarize" => {
+                let compacted = crate::compaction::compact_context(&mut self.messages);
+                if !compacted {
+                    println!("{} 当前对话轮次或 Token 数量较少，无需压缩。", "ℹ".blue());
+                }
+            }
+            "/tasks" => {
+                let tm = crate::tools::get_task_manager();
+                let list = tm.list_tasks();
+                println!("{}", "── 当前后台任务清单 (Background Tasks) ──".cyan().bold());
+                if list.is_empty() {
+                    println!("  暂无后台任务。可让 Agent 使用带 is_background=true 的 bash 启动守护任务。");
+                } else {
+                    for (id, cmd, status, started) in list {
+                        println!("  • {:<10} {:<24} {} (启动于: {})", id.yellow().bold(), status, cmd, started);
+                    }
+                    println!("\n提示: 输入 {} 终止任务，或输入 {} 查看日志", "/kill <ID>".bold(), "/logs <ID>".bold());
+                }
+            }
+            "/kill" => {
+                if let Some(id) = args.first() {
+                    let res = crate::tools::get_task_manager().kill_task(id).await;
+                    match res {
+                        Ok(msg) => println!("{}", msg),
+                        Err(e) => println!("{} {}", "✖ 终止任务失败:".red(), e),
+                    }
+                } else {
+                    println!("{} 请指定要终止的任务 ID，例如 /kill task-1", "ℹ".blue());
+                }
+            }
+            "/logs" => {
+                if let Some(id) = args.first() {
+                    let limit = args.get(1).and_then(|v| v.parse::<usize>().ok());
+                    match crate::tools::get_task_manager().get_logs(id, limit) {
+                        Ok(logs) => println!("{}", logs),
+                        Err(e) => println!("{} {}", "✖ 查询日志失败:".red(), e),
+                    }
+                } else {
+                    println!("{} 请指定任务 ID，例如 /logs task-1", "ℹ".blue());
+                }
+            }
+            "/mcp" => {
+                let mcp = crate::tools::get_mcp_registry();
+                let srvs = mcp.list_servers_info().await;
+                println!("{}", "── 已挂载 MCP 外部服务 (Model Context Protocol) ──".cyan().bold());
+                if srvs.is_empty() {
+                    println!("  未检测到活跃的 MCP 服务。可在 ~/.workbd/mcp.json 或 ~/.codebuddy/mcp.json 声明第三方服务。");
+                } else {
+                    for (name, count) in srvs {
+                        println!("  • {} (提供 {} 个工具)", name.green().bold(), count.to_string().yellow().bold());
+                    }
+                }
+            }
             "/model" | "/m" => {
                 if args.is_empty() {
                     self.list_and_show_models().await;
@@ -510,6 +579,11 @@ impl ReplSession {
         println!("  {:<26} 加载技能并注入到当前对话上下文", "/skill use <name>".yellow());
         println!("  {:<26} 查看指定技能的完整文档正文", "/skill show <name>".yellow());
         println!("  {:<26} 发起 OAuth 设备授权登录 (支持 cn 或 global)", "/login [realm]".yellow());
+        println!("  {:<26} 一键回滚最近一次文件修改与执行步骤", "/undo".yellow());
+        println!("  {:<26} 智能修剪压缩对话历史长上下文", "/compact, /summarize".yellow());
+        println!("  {:<26} 查看与管理后台长驻守护任务", "/tasks, /kill <id>".yellow());
+        println!("  {:<26} 查看后台任务实时日志输出", "/logs <id> [lines]".yellow());
+        println!("  {:<26} 查看已挂载的 MCP 外部服务与工具", "/mcp".yellow());
         println!("  {:<26} 清空当前会话上下文", "/clear, /c".yellow());
         println!("  {:<26} 查看当前会话轮数及信息", "/history".yellow());
         println!("  {:<26} 查看或修改系统提示词", "/system [prompt]".yellow());
