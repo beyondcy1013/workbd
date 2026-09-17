@@ -12,6 +12,7 @@ use rustyline::{
 };
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 struct CtrlCClearHandler {
@@ -111,6 +112,8 @@ impl ReplSession {
 
         let _ = rl.load_history(&history_file);
 
+        let mut last_ctrl_c: Option<Instant> = None;
+
         loop {
             let prompt = format!(
                 "{} {} ",
@@ -121,6 +124,7 @@ impl ReplSession {
             let readline = rl.readline(&prompt);
             match readline {
                 Ok(line) => {
+                    last_ctrl_c = None;
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -138,6 +142,15 @@ impl ReplSession {
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
+                    let now = Instant::now();
+                    if let Some(prev) = last_ctrl_c {
+                        if now.duration_since(prev) <= Duration::from_millis(3000) {
+                            println!("{}", "\n已退出 WorkBuddy CLI。".green());
+                            break;
+                        }
+                    }
+                    last_ctrl_c = Some(now);
+
                     // 如果清屏前输入行中有未提交的内容，将其存入历史缓存，按方向键上下可立刻找回
                     if let Some(draft) = interrupted_line.lock().unwrap().take() {
                         let _ = rl.add_history_entry(&draft);
@@ -145,6 +158,7 @@ impl ReplSession {
                     // 一次 Ctrl+C 全终端清屏并将光标复位
                     print!("\x1B[2J\x1B[1;1H\x1B[3J");
                     let _ = io::stdout().flush();
+                    println!("{}", "已清屏（按 ↑ 键找回草稿，再次按 Ctrl+C 退出）".dimmed());
                 }
                 Err(ReadlineError::Eof) => {
                     println!("{}", "\n再见！".green());
