@@ -66,30 +66,61 @@ struct AccountData {
     enterprise_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct AuthFileModel {
-    account: AuthFileAccount,
-    auth: AuthFileDetails,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthFileModel {
+    pub account: AuthFileAccount,
+    pub auth: AuthFileDetails,
 }
 
-#[derive(Debug, Serialize)]
-struct AuthFileAccount {
-    uid: String,
-    #[serde(rename = "enterpriseId")]
-    enterprise_id: String,
-    nickname: String,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthFileAccount {
+    pub uid: String,
+    #[serde(rename = "enterpriseId", default)]
+    pub enterprise_id: String,
+    pub nickname: String,
 }
 
-#[derive(Debug, Serialize)]
-struct AuthFileDetails {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthFileDetails {
     #[serde(rename = "accessToken")]
-    access_token: String,
+    pub access_token: String,
     #[serde(rename = "refreshToken")]
-    refresh_token: String,
+    pub refresh_token: String,
     #[serde(rename = "expiresAt")]
-    expires_at: i64,
-    domain: String,
-    realm: String,
+    pub expires_at: i64,
+    #[serde(default)]
+    pub domain: String,
+    #[serde(default)]
+    pub realm: String,
+}
+
+pub fn list_saved_accounts() -> Vec<AuthFileModel> {
+    let mut accounts = Vec::new();
+    let dirs = vec![
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".workbd").join("accounts"),
+        PathBuf::from("/home/bin/workbuddy2api/auths"),
+        PathBuf::from("/home/codes/third_party/workbuddy2api/auths"),
+    ];
+    let mut seen_uids = std::collections::HashSet::new();
+
+    for d in dirs {
+        if let Ok(entries) = fs::read_dir(d) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_file() && p.extension().map(|e| e == "json").unwrap_or(false) {
+                    if let Ok(content) = fs::read_to_string(&p) {
+                        if let Ok(model) = serde_json::from_str::<AuthFileModel>(&content) {
+                            if !seen_uids.contains(&model.account.uid) {
+                                seen_uids.insert(model.account.uid.clone());
+                                accounts.push(model);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    accounts
 }
 
 fn build_headers(origin: &str) -> HeaderMap {

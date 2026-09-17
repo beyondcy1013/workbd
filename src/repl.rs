@@ -5,11 +5,17 @@ use crate::oauth::run_oauth_login;
 use crate::skills::SkillRegistry;
 use crate::types::ChatMessage;
 use colored::*;
+use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
 use rustyline::{
-    Cmd, ConditionalEventHandler, DefaultEditor, Event, EventContext, EventHandler, KeyEvent,
-    RepeatCount,
+    Cmd, ColorMode, CompletionType, ConditionalEventHandler, Config, Context, Editor, Event,
+    EventContext, EventHandler, Helper, KeyEvent, RepeatCount,
 };
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +32,166 @@ impl ConditionalEventHandler for CtrlCClearHandler {
             *self.interrupted_line.lock().unwrap() = Some(line.to_string());
         }
         Some(Cmd::Interrupt)
+    }
+}
+
+struct WorkbdHelper {
+    commands: Vec<(&'static str, &'static [&'static str], &'static str)>,
+}
+
+impl Validator for WorkbdHelper {}
+impl Helper for WorkbdHelper {}
+
+impl Default for WorkbdHelper {
+    fn default() -> Self {
+        Self {
+            commands: vec![
+                ("/help", &[], "显示命令帮助菜单"),
+                ("/model", &["deepseek-v4.1-flash", "gemini-3.5-flash", "gpt-5.6-sol", "kimi-k3", "glm-5.3", "auto"], "切换模型或查看模型列表"),
+                ("/image", &["clipboard"], "粘贴剪贴板截图或指定图片分析"),
+                ("/img", &["clipboard"], "粘贴剪贴板截图或指定图片分析"),
+                ("/agent", &["on", "off"], "开启/关闭自主编程工具模式"),
+                ("/permission", &["ask", "allow-all"], "设置工具调用权限(询问/允许所有)"),
+                ("/skills", &[], "查看所有 Codex/系统活跃技能"),
+                ("/skill", &["list", "search", "show", "use"], "技能管理(列表/搜索/查看/加载)"),
+                ("/clear", &[], "清空当前会话上下文"),
+                ("/compact", &[], "压缩长上下文对话历史"),
+                ("/summarize", &[], "压缩长上下文对话历史"),
+                ("/undo", &[], "回滚最近一次文件修改与步骤"),
+                ("/tasks", &[], "查看后台驻留守护任务"),
+                ("/kill", &[], "终止后台守护任务 (/kill <id>)"),
+                ("/logs", &[], "查看后台任务日志 (/logs <id>)"),
+                ("/mcp", &[], "查看挂载的 MCP 外部服务"),
+                ("/login", &["cn", "global"], "发起官方 OAuth 设备流授权登录"),
+                ("/system", &[], "查看或设置系统提示词"),
+                ("/history", &[], "查看当前会话轮数与统计"),
+                ("/config", &[], "查看当前配置与状态"),
+                ("/status", &[], "查看当前登录账号、授权方式与运行状态"),
+                ("/exit", &[], "退出程序"),
+                ("/quit", &[], "退出程序"),
+            ],
+        }
+    }
+}
+
+impl Highlighter for WorkbdHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("\x1b[90m{}\x1b[0m", hint))
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        true
+    }
+}
+
+impl Hinter for WorkbdHelper {
+    type Hint = String;
+
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        if !line.starts_with('/') || pos != line.len() {
+            return None;
+        }
+
+        let slice = line;
+
+        // 1. 一级命令逐字提示
+        if !slice.contains(' ') {
+            if slice == "/" {
+                return Some("help".to_string());
+            }
+            for (cmd, _, _) in &self.commands {
+                if *cmd == slice {
+                    return None;
+                }
+                if cmd.starts_with(slice) {
+                    return Some(cmd[slice.len()..].to_string());
+                }
+            }
+            return None;
+        }
+
+        // 2. 二级参数逐字提示 (例如 `/permission a` 提示 `llow-all`)
+        let parts: Vec<&str> = slice.split_whitespace().collect();
+        if parts.is_empty() {
+            return None;
+        }
+        let cmd_name = parts[0];
+        let sub_prefix = if slice.ends_with(' ') {
+            ""
+        } else {
+            parts.get(1).copied().unwrap_or("")
+        };
+
+        if let Some((_, subcmds, _)) = self.commands.iter().find(|(n, _, _)| *n == cmd_name) {
+            if sub_prefix.is_empty() {
+                if let Some(first_sub) = subcmds.first() {
+                    return Some(format!(" {}", first_sub));
+                }
+            } else {
+                for sub in *subcmds {
+                    if sub.starts_with(sub_prefix) && *sub != sub_prefix {
+                        return Some(sub[sub_prefix.len()..].to_string());
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
+
+impl Completer for WorkbdHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        if !line.starts_with('/') {
+            return Ok((0, Vec::new()));
+        }
+
+        let slice = &line[..pos];
+        let parts: Vec<&str> = slice.split_whitespace().collect();
+
+        // 补全一级命令（如 /m -> /model）
+        if !slice.contains(' ') {
+            let matches: Vec<Pair> = self
+                .commands
+                .iter()
+                .filter(|(name, _, _)| name.starts_with(slice))
+                .map(|(name, _, desc)| Pair {
+                    display: format!("{:<14} {}", name, desc),
+                    replacement: format!("{} ", name),
+                })
+                .collect();
+            return Ok((0, matches));
+        }
+
+        // 补全二级参数
+        if !parts.is_empty() {
+            let cmd_name = parts[0];
+            let sub_prefix = if slice.ends_with(' ') {
+                ""
+            } else {
+                parts.get(1).copied().unwrap_or("")
+            };
+            if let Some((_, subcmds, _)) = self.commands.iter().find(|(n, _, _)| *n == cmd_name) {
+                let matches: Vec<Pair> = subcmds
+                    .iter()
+                    .filter(|s| s.starts_with(sub_prefix))
+                    .map(|sub| Pair {
+                        display: format!("{} {}", cmd_name, sub),
+                        replacement: format!("{} {} ", cmd_name, sub),
+                    })
+                    .collect();
+                return Ok((0, matches));
+            }
+        }
+
+        Ok((0, Vec::new()))
     }
 }
 
@@ -97,10 +263,18 @@ impl ReplSession {
         );
 
         let history_file = AppConfig::history_file_path();
-        let mut rl = DefaultEditor::new().unwrap_or_else(|_| {
+        let config = Config::builder()
+            .auto_add_history(false)
+            .tab_stop(4)
+            .color_mode(ColorMode::Forced)
+            .completion_type(CompletionType::Circular)
+            .build();
+
+        let mut rl = Editor::<WorkbdHelper, DefaultHistory>::with_config(config).unwrap_or_else(|_| {
             eprintln!("{}", "警告: 终端行编辑器初始化失败，进入普通模式".yellow());
-            DefaultEditor::new().unwrap()
+            Editor::new().unwrap()
         });
+        rl.set_helper(Some(WorkbdHelper::default()));
 
         let interrupted_line = Arc::new(Mutex::new(None));
         let ctrl_c_handler = Box::new(CtrlCClearHandler {
@@ -385,6 +559,9 @@ impl ReplSession {
                 println!("Agent 模式: {}", if self.agent_mode { "已开启" } else { "已关闭" });
                 println!("权限模式: {}", self.config.permission_mode);
                 println!("温度参数: {}", self.config.temperature);
+            }
+            "/status" => {
+                self.show_status();
             }
             _ => {
                 println!(
@@ -723,6 +900,85 @@ impl ReplSession {
         println!("  {:<28} 允许所有工具自主执行，无需每次询问", "/permission allow-all".yellow());
     }
 
+    pub fn show_status(&self) {
+        println!("{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
+        println!("{}", "║              WorkBuddy 系统运行状态与当前账号                ║".cyan().bold());
+        println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+
+        // 1. 登录账号与认证信息
+        println!("{}", "▶ 当前登录账号 (Official Account):".bold());
+        let accounts = crate::oauth::list_saved_accounts();
+        if accounts.is_empty() {
+            println!("  • {:<12} {}", "登录状态:".dimmed(), "未绑定官方 OAuth 账号 (使用本地/自定义 API Key)".yellow());
+            println!("  • {:<12} {}", "认证方式:".dimmed(), "Direct API Key / 本地代理凭证");
+            println!("  • {:<12} {}", "账号提示:".dimmed(), "输入 /login (国内版) 或 /login global (国际版) 绑定官方账号".cyan());
+        } else {
+            for (idx, acc) in accounts.iter().enumerate() {
+                let badge = if idx == 0 { "[当前主力账号]".green() } else { "[备用账号]".dimmed() };
+                let realm_display = match acc.auth.realm.as_str() {
+                    "global" => "国际版 (Global - www.workbuddy.ai)".green().bold(),
+                    "cn" => "国内版 (CN - www.codebuddy.cn)".green().bold(),
+                    other => other.yellow().bold(),
+                };
+
+                let now_sec = chrono::Utc::now().timestamp();
+                let exp_sec = acc.auth.expires_at;
+                let token_status = if exp_sec > now_sec {
+                    let diff_days = (exp_sec - now_sec) / 86400;
+                    let dt = chrono::DateTime::from_timestamp(exp_sec, 0)
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                        .unwrap_or_else(|| "未知".to_string());
+                    format!("{} (有效至: {}, 剩余约 {} 天)", "有效 (Active)".green().bold(), dt, diff_days)
+                } else {
+                    "已过期，输入 /login 重新授权".red().bold().to_string()
+                };
+
+                println!("  • {} {:<10} {}", badge, "用户昵称:", acc.account.nickname.yellow().bold());
+                println!("    {:<12} {}", "用户 UID:", acc.account.uid.dimmed());
+                println!("    {:<12} {}", "所属平台:", realm_display);
+                println!("    {:<12} {}", "登录方式:", "官方原生 OAuth 设备流授权 (Device Flow)".cyan());
+                println!("    {:<12} {}", "凭证状态:", token_status);
+                let ent = if acc.account.enterprise_id.is_empty() {
+                    "个人开发者 (无企业限制)".to_string()
+                } else {
+                    acc.account.enterprise_id.clone()
+                };
+                println!("    {:<12} {}", "企业组织:", ent);
+            }
+        }
+
+        // 2. 当前运行参数与模型
+        println!("\n{}", "▶ API 服务与运行参数:".bold());
+        println!("  • {:<12} {}", "API 基址:", self.config.api_base.cyan());
+        let model_name = crate::models_catalog::find_official_model(&self.current_model)
+            .map(|d| format!("{} ({})", d.name, self.current_model))
+            .unwrap_or_else(|| self.current_model.clone());
+        println!("  • {:<12} {}", "当前模型:", model_name.green().bold());
+        println!("  • {:<12} {}", "Agent 模式:", if self.agent_mode { "已开启 (具备读写文件/执行命令/搜索代码自主权限)".green() } else { "已关闭 (纯对话模式)".yellow() });
+        println!("  • {:<12} {}", "权限模式:", self.config.permission_mode.to_string().cyan());
+        println!("  • {:<12} {}", "采样温度:", self.config.temperature);
+
+        // 3. 当前会话上下文统计
+        let user_count = self.messages.iter().filter(|m| m.role == "user").count();
+        let assistant_count = self.messages.iter().filter(|m| m.role == "assistant").count();
+        let tool_count = self.messages.iter().filter(|m| m.role == "tool").count();
+        let est_tokens = crate::compaction::estimate_tokens(&self.messages);
+
+        println!("\n{}", "▶ 当前会话上下文统计:".bold());
+        println!(
+            "  • 消息总数: {} 条 (用户提问: {}, AI 回复: {}, 工具调用: {})",
+            self.messages.len().to_string().yellow().bold(),
+            user_count,
+            assistant_count,
+            tool_count
+        );
+        println!(
+            "  • 累计体积: 约 {} 字符 / 估算 {} Tokens",
+            est_tokens.to_string().yellow(),
+            (est_tokens / 4).to_string().cyan().bold()
+        );
+    }
+
     pub fn print_help(&self) {
         println!("{}", "── WorkBuddy Code Agent 命令帮助 ──".cyan().bold());
         println!("  {:<26} 显示当前可用模型列表", "/model, /m".yellow());
@@ -737,6 +993,7 @@ impl ReplSession {
         println!("  {:<26} 加载技能并注入到当前对话上下文", "/skill use <name>".yellow());
         println!("  {:<26} 查看指定技能的完整文档正文", "/skill show <name>".yellow());
         println!("  {:<26} 发起 OAuth 设备授权登录 (支持 cn 或 global)", "/login [realm]".yellow());
+        println!("  {:<26} 查看当前登录账号、授权状态与系统信息", "/status".yellow());
         println!("  {:<26} 一键回滚最近一次文件修改与执行步骤", "/undo".yellow());
         println!("  {:<26} 智能修剪压缩对话历史长上下文", "/compact, /summarize".yellow());
         println!("  {:<26} 查看与管理后台长驻守护任务", "/tasks, /kill <id>".yellow());

@@ -91,6 +91,10 @@ struct Cli {
     #[arg(long, value_name = "IMAGE_PATH")]
     image: Option<String>,
 
+    /// 查看当前登录账号、授权状态与系统信息并退出
+    #[arg(long)]
+    status: bool,
+
     /// 列出所有可用模型并退出
     #[arg(short = 'l', long)]
     list_models: bool,
@@ -99,6 +103,14 @@ struct Cli {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    // 检查是否为查看状态命令
+    if cli.status {
+        let config = AppConfig::load();
+        let session = ReplSession::new(config);
+        session.show_status();
+        return;
+    }
 
     // 检查是否为直接登录命令
     if let Some(realm_opt) = cli.login {
