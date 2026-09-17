@@ -11,7 +11,7 @@ use agent::AgentRunner;
 use clap::Parser;
 use client::ApiClient;
 use colored::*;
-use config::AppConfig;
+use config::{AppConfig, PermissionMode};
 use oauth::run_oauth_login;
 use repl::ReplSession;
 use skills::SkillRegistry;
@@ -50,6 +50,14 @@ struct Cli {
     /// 禁用 Agent 工具调用权限（进入纯对话模式）
     #[arg(long)]
     no_agent: bool,
+
+    /// 工具执行权限模式 (ask: 每次调用前询问确认, allow-all: 允许所有)
+    #[arg(long, value_name = "MODE")]
+    permission: Option<String>,
+
+    /// 工具调用前强制询问确认 (等价于 --permission ask)
+    #[arg(long)]
+    ask: bool,
 
     /// 预先载入并激活指定技能（支持 Codex 技能或离线技能）
     #[arg(long, value_name = "SKILL_NAME")]
@@ -114,6 +122,17 @@ async fn main() {
     }
     if cli.no_skills {
         config.codex_skills = false;
+    }
+    if cli.ask {
+        config.permission_mode = PermissionMode::Ask;
+    } else if let Some(ref p) = cli.permission {
+        match p.to_lowercase().as_str() {
+            "ask" | "询问" | "confirm" => config.permission_mode = PermissionMode::Ask,
+            "allow-all" | "allow_all" | "all" | "允许所有" | "auto" => {
+                config.permission_mode = PermissionMode::AllowAll
+            }
+            _ => eprintln!("{} 未知权限模式 \"{}\"，使用默认配置", "⚠".yellow(), p),
+        }
     }
 
     // 处理技能列表
@@ -216,6 +235,7 @@ async fn main() {
             config.temperature,
         );
         runner.tools_enabled = config.agent_mode;
+        runner.permission_mode = config.permission_mode;
 
         if let Err(e) = runner.execute_turn(&mut messages).await {
             eprintln!("\n{} {}", "执行失败:".red().bold(), e);

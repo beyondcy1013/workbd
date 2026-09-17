@@ -1,6 +1,6 @@
 use crate::agent::AgentRunner;
 use crate::client::ApiClient;
-use crate::config::AppConfig;
+use crate::config::{AppConfig, PermissionMode};
 use crate::oauth::run_oauth_login;
 use crate::skills::SkillRegistry;
 use crate::types::ChatMessage;
@@ -59,8 +59,13 @@ impl ReplSession {
         };
         println!("{} {}", "▶ Agent 模式:".bold(), agent_status_text);
         println!(
+            "{} {}",
+            "▶ 权限模式:".bold(),
+            self.config.permission_mode.to_string().cyan().bold()
+        );
+        println!(
             "{}",
-            "输入 /model 切换模型，/agent 开关工具权限，/login 登录，/help 命令帮助，/exit 退出。\n".dimmed()
+            "输入 /model 切换模型，/permission 设置权限，/agent 开关自主工具，/help 查看帮助。\n".dimmed()
         );
 
         let history_file = AppConfig::history_file_path();
@@ -178,6 +183,29 @@ impl ReplSession {
                     println!("{}", "✔ Agent 自主工具已关闭，切换至纯对话模式。".yellow());
                 }
             }
+            "/permission" | "/p" => {
+                if args.is_empty() {
+                    self.show_permission_status();
+                } else {
+                    let opt = args.join(" ").to_lowercase();
+                    match opt.as_str() {
+                        "ask" | "询问" | "confirm" | "prompt" => {
+                            self.config.permission_mode = PermissionMode::Ask;
+                            let _ = self.config.save();
+                            println!("✔ 工具权限已设置为: {} (每次调用工具前将弹出确认请求)", "询问 (Ask)".green().bold());
+                        }
+                        "allow-all" | "allow_all" | "all" | "允许所有" | "允许" | "auto" | "yes" => {
+                            self.config.permission_mode = PermissionMode::AllowAll;
+                            let _ = self.config.save();
+                            println!("✔ 工具权限已设置为: {} (所有工具自主调用，无需每次询问)", "允许所有 (Allow All)".green().bold());
+                        }
+                        _ => {
+                            println!("{} 未知权限选项: \"{}\"", "✖".red(), opt);
+                            self.show_permission_status();
+                        }
+                    }
+                }
+            }
             "/login" => {
                 let realm = args.first().copied().unwrap_or("cn");
                 println!("正在发起 OAuth 登录流程 (域: {})...", realm);
@@ -228,6 +256,7 @@ impl ReplSession {
                 println!("API 基址: {}", self.config.api_base);
                 println!("当前模型: {}", self.current_model);
                 println!("Agent 模式: {}", if self.agent_mode { "已开启" } else { "已关闭" });
+                println!("权限模式: {}", self.config.permission_mode);
                 println!("温度参数: {}", self.config.temperature);
             }
             _ => {
@@ -335,11 +364,17 @@ impl ReplSession {
             self.config.temperature,
         );
         runner.tools_enabled = self.agent_mode;
+        runner.permission_mode = self.config.permission_mode;
 
         if let Err(e) = runner.execute_turn(&mut self.messages).await {
             println!("\n{} {}", "✖ 请求或执行失败:".red().bold(), e);
             // 发生致命错误时移除最后一条用户消息防污染
             self.messages.pop();
+        }
+
+        if runner.permission_mode != self.config.permission_mode {
+            self.config.permission_mode = runner.permission_mode;
+            let _ = self.config.save();
         }
     }
 
@@ -451,6 +486,14 @@ impl ReplSession {
         }
     }
 
+    fn show_permission_status(&self) {
+        println!("{}", "── Agent 工具执行权限状态 ──".cyan().bold());
+        println!("当前权限模式: {}", self.config.permission_mode.to_string().yellow().bold());
+        println!("\n可用权限选项:");
+        println!("  {:<28} 每次调用工具前均弹出询问确认 [y: 允许 / n: 拒绝 / a: 允许后续所有]", "/permission ask".yellow());
+        println!("  {:<28} 允许所有工具自主执行，无需每次询问", "/permission allow-all".yellow());
+    }
+
     pub fn print_help(&self) {
         println!("{}", "── WorkBuddy Code Agent 命令帮助 ──".cyan().bold());
         println!("  {:<26} 显示当前可用模型列表", "/model, /m".yellow());
@@ -459,6 +502,7 @@ impl ReplSession {
             "/model <name>".yellow()
         );
         println!("  {:<26} 开启/关闭 Agent 自主编程工具权限", "/agent [on|off]".yellow());
+        println!("  {:<26} 设置工具执行权限 (ask 询问 / allow-all 允许所有)", "/permission [mode]".yellow());
         println!("  {:<26} 查看所有 Codex / 系统活跃技能", "/skills, /skill list".yellow());
         println!("  {:<26} 检索 Codex 与 700+ 离线技能库", "/skill search <query>".yellow());
         println!("  {:<26} 加载技能并注入到当前对话上下文", "/skill use <name>".yellow());

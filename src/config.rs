@@ -2,6 +2,28 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    Ask,
+    AllowAll,
+}
+
+impl Default for PermissionMode {
+    fn default() -> Self {
+        PermissionMode::AllowAll
+    }
+}
+
+impl std::fmt::Display for PermissionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PermissionMode::Ask => write!(f, "询问 (Ask)"),
+            PermissionMode::AllowAll => write!(f, "允许所有 (Allow All)"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub api_base: String,
@@ -11,6 +33,8 @@ pub struct AppConfig {
     pub temperature: f32,
     #[serde(default = "default_true")]
     pub agent_mode: bool,
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
     #[serde(default = "default_true")]
     pub codex_skills: bool,
     #[serde(default)]
@@ -30,6 +54,7 @@ impl Default for AppConfig {
             system_prompt: "You are WorkBuddy Code, an expert autonomous AI software engineer. You have access to local workspace tools (bash, read_file, write_file, replace_in_file, list_dir, search_code, load_skill, search_skills). Always proactively inspect code, make changes, and verify with tests/builds via bash.".to_string(),
             temperature: 0.5,
             agent_mode: true,
+            permission_mode: PermissionMode::AllowAll,
             codex_skills: true,
             custom_skills_dirs: Vec::new(),
         }

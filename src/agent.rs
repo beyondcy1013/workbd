@@ -1,4 +1,5 @@
 use crate::client::{ApiClient, StreamEvent};
+use crate::config::PermissionMode;
 use crate::tools::{all_tools, execute_tool};
 use crate::types::{ChatMessage, FunctionCall, ToolCall};
 use colored::*;
@@ -10,6 +11,7 @@ pub struct AgentRunner {
     pub model: String,
     pub temperature: f32,
     pub tools_enabled: bool,
+    pub permission_mode: PermissionMode,
     pub max_steps: usize,
 }
 
@@ -20,11 +22,12 @@ impl AgentRunner {
             model,
             temperature,
             tools_enabled: true,
+            permission_mode: PermissionMode::AllowAll,
             max_steps: 25,
         }
     }
 
-    pub async fn execute_turn(&self, messages: &mut Vec<ChatMessage>) -> Result<(), String> {
+    pub async fn execute_turn(&mut self, messages: &mut Vec<ChatMessage>) -> Result<(), String> {
         let tools = if self.tools_enabled {
             Some(all_tools())
         } else {
@@ -161,18 +164,51 @@ impl AgentRunner {
             // 逐个执行工具并存入 tool 角色消息
             for call in tool_calls {
                 let tool_name = &call.function.name;
-                let args_snippet = if call.function.arguments.len() > 100 {
-                    format!("{}...", &call.function.arguments[..100])
-                } else {
-                    call.function.arguments.clone()
-                };
+                let preview = format_tool_preview(tool_name, &call.function.arguments);
 
-                println!(
-                    "{} {} {}",
-                    "⚡ [Agent 工具调用]".yellow().bold(),
-                    tool_name.cyan().bold(),
-                    args_snippet.dimmed()
-                );
+                if self.permission_mode == PermissionMode::Ask {
+                    println!(
+                        "{} {} ➜ {}",
+                        "⚡ [Agent 申请执行工具]".yellow().bold(),
+                        tool_name.cyan().bold(),
+                        preview.white()
+                    );
+                    print!(
+                        "{} 是否允许执行此工具? [y: 允许 / n: 拒绝 / a: 允许后续所有]: ",
+                        "?".yellow().bold()
+                    );
+                    let _ = io::stdout().flush();
+
+                    let mut user_input = String::new();
+                    let allowed = if io::stdin().read_line(&mut user_input).is_ok() {
+                        let ans = user_input.trim().to_lowercase();
+                        if ans == "a" || ans == "all" || ans == "允许所有" || ans == "始终允许" {
+                            self.permission_mode = PermissionMode::AllowAll;
+                            println!("  {}", "✔ 已切换为允许所有工具执行 (Allow All)。".green());
+                            true
+                        } else if ans == "y" || ans == "yes" || ans == "是" || ans.is_empty() {
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    if !allowed {
+                        println!("  {}", "✖ 已拒绝执行该工具。".red().bold());
+                        let denied_msg = format!("Error: User denied permission to execute tool '{}'. Please adjust your approach or ask the user for further instructions.", tool_name);
+                        messages.push(ChatMessage::tool(call.id, denied_msg));
+                        continue;
+                    }
+                } else {
+                    println!(
+                        "{} {} ➜ {}",
+                        "⚡ [Agent 工具调用]".yellow().bold(),
+                        tool_name.cyan().bold(),
+                        preview.dimmed()
+                    );
+                }
 
                 let start_time = std::time::Instant::now();
                 let output = execute_tool(tool_name, &call.function.arguments).await;
@@ -194,5 +230,58 @@ impl AgentRunner {
         }
 
         Err("Agent 达到最大执行步骤上限 (25 轮) 自动终止".to_string())
+    }
+}
+
+fn format_tool_preview(tool_name: &str, args_json: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) {
+        match tool_name {
+            "bash" => {
+                if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
+                    return format!("执行终端命令: {}", cmd);
+                }
+            }
+            "write_file" => {
+                if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+                    let bytes = v.get("content").and_then(|c| c.as_str()).map(|c| c.len()).unwrap_or(0);
+                    return format!("写入文件: {} ({} 字节)", path, bytes);
+                }
+            }
+            "replace_in_file" => {
+                if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+                    return format!("替换文件内容: {}", path);
+                }
+            }
+            "read_file" => {
+                if let Some(path) = v.get("path").and_then(|p| p.as_str()) {
+                    return format!("读取文件: {}", path);
+                }
+            }
+            "list_dir" => {
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+                return format!("浏览目录: {}", path);
+            }
+            "search_code" => {
+                if let Some(q) = v.get("query").and_then(|q| q.as_str()) {
+                    return format!("搜索代码: \"{}\"", q);
+                }
+            }
+            "load_skill" => {
+                if let Some(name) = v.get("name").and_then(|n| n.as_str()) {
+                    return format!("加载技能: {}", name);
+                }
+            }
+            "search_skills" => {
+                if let Some(q) = v.get("query").and_then(|q| q.as_str()) {
+                    return format!("检索技能库: \"{}\"", q);
+                }
+            }
+            _ => {}
+        }
+    }
+    if args_json.len() > 100 {
+        format!("{}...", &args_json[..100])
+    } else {
+        args_json.to_string()
     }
 }
