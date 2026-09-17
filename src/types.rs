@@ -155,7 +155,7 @@ pub struct ModelListResponse {
     pub data: Vec<ModelData>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelData {
     pub id: String,
     #[serde(default)]
@@ -164,4 +164,54 @@ pub struct ModelData {
     pub description: Option<String>,
     #[serde(default)]
     pub credits: Option<String>,
+    #[serde(default)]
+    pub vendor: Option<String>,
+    #[serde(default)]
+    pub context_length: Option<i64>,
+}
+
+#[allow(dead_code)]
+impl ModelData {
+    pub fn clean_id(&self) -> &str {
+        self.id
+            .strip_prefix("global:")
+            .or_else(|| self.id.strip_prefix("cn:"))
+            .unwrap_or(&self.id)
+    }
+
+    pub fn display_name(&self) -> String {
+        if let Some(ref n) = self.name {
+            if !n.trim().is_empty() {
+                return n.clone();
+            }
+        }
+        let clean = self.clean_id();
+        crate::models_catalog::find_official_model(clean)
+            .map(|def| def.name.to_string())
+            .unwrap_or_else(|| clean.to_string())
+    }
+
+    pub fn display_credits(&self) -> String {
+        if let Some(ref c) = self.credits {
+            if !c.trim().is_empty() && c != "-" {
+                return c.clone();
+            }
+        }
+        let clean = self.clean_id();
+        crate::models_catalog::find_official_model(clean)
+            .map(|def| def.credits.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    }
+
+    pub fn display_description(&self) -> String {
+        if let Some(ref d) = self.description {
+            if !d.trim().is_empty() {
+                return d.clone();
+            }
+        }
+        let clean = self.clean_id();
+        crate::models_catalog::find_official_model(clean)
+            .map(|def| def.description.to_string())
+            .unwrap_or_default()
+    }
 }

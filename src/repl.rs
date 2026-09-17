@@ -20,7 +20,12 @@ pub struct ReplSession {
 impl ReplSession {
     pub fn new(config: AppConfig) -> Self {
         let client = ApiClient::new(&config.api_base, &config.api_key);
-        let current_model = config.default_model.clone();
+        let raw_model = config.default_model.clone();
+        let current_model = raw_model
+            .strip_prefix("global:")
+            .or_else(|| raw_model.strip_prefix("cn:"))
+            .unwrap_or(&raw_model)
+            .to_string();
         let agent_mode = config.agent_mode;
         let mut messages = Vec::new();
         let effective_sys = config.build_effective_system_prompt();
@@ -42,10 +47,13 @@ impl ReplSession {
         println!("{}", "║              WorkBuddy Code (workbd Autonomous Agent)        ║".cyan().bold());
         println!("{}", "║        Native Rust Agent for WorkBuddy / CodeBuddy AI        ║".cyan());
         println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
+        let model_display = crate::models_catalog::find_official_model(&self.current_model)
+            .map(|d| format!("{} ({})", d.name, self.current_model))
+            .unwrap_or_else(|| self.current_model.clone());
         println!(
             "{} {}",
             "▶ 当前模型:".bold(),
-            self.current_model.green().bold()
+            model_display.green().bold()
         );
         println!(
             "{} {}",
@@ -207,8 +215,7 @@ impl ReplSession {
                 }
             }
             "/login" => {
-                let realm = args.first().copied().unwrap_or("cn");
-                println!("正在发起 OAuth 登录流程 (域: {})...", realm);
+                let realm = args.first().copied().unwrap_or("");
                 if let Err(e) = run_oauth_login(realm).await {
                     println!("{} {}", "✖ 登录出错:".red().bold(), e);
                 }
@@ -277,34 +284,16 @@ impl ReplSession {
 
         match self.client.list_models().await {
             Ok(models) => {
-                println!("\r{}", "── 可用模型列表 ──".cyan().bold());
-                for m in models {
-                    let is_current = m.id == self.current_model
-                        || (m.id.starts_with("global:") && m.id.strip_prefix("global:") == Some(&self.current_model));
-                    let mark = if is_current { "● [当前]".green().bold() } else { "○".dimmed() };
-                    let credits = m.credits.unwrap_or_else(|| "-".into());
-                    let desc = m.description.unwrap_or_default();
-                    println!(
-                        "  {} {:<32} {:<10} {}",
-                        mark,
-                        m.id.yellow().bold(),
-                        format!("[{}]", credits).dimmed(),
-                        desc.dimmed()
-                    );
-                }
-                println!(
-                    "\n提示: 输入 {} 切换模型，例如 {}",
-                    "/model <模型名称>".bold(),
-                    "/model deepseek-v4.1-flash".green()
-                );
+                print!("\r");
+                crate::models_catalog::display_models_catalog(&models, &self.current_model);
             }
             Err(e) => {
                 println!("\r{} {}", "✖ 获取模型列表失败:".red(), e);
                 println!(
                     "常见内置模型: {}, {}, {}, {}",
+                    "auto".green(),
                     "deepseek-v4.1-flash".green(),
-                    "global:deepseek-v4.1-flash".green(),
-                    "gpt-5.5".yellow(),
+                    "gpt-5.6-sol".yellow(),
                     "gemini-3.5-flash".yellow()
                 );
             }
@@ -313,45 +302,58 @@ impl ReplSession {
 
     async fn switch_model(&mut self, target: &str) {
         let target = target.trim();
-        match self.client.list_models().await {
+        let clean_target = match target.to_lowercase().as_str() {
+            "auto" => "default-model",
+            "fast" => "fast-model",
+            "balanced" => "balanced-model",
+            "primary" => "primary-model",
+            "deep" => "deep-model",
+            "deepseek" | "ds" => "deepseek-v4.1-flash",
+            "kimi" => "kimi-k3",
+            "glm" => "glm-5.3",
+            "gemini" => "gemini-3.5-flash",
+            _ => target,
+        };
+
+        let resolved_id = match self.client.list_models().await {
             Ok(models) => {
-                // 1. 完全精确匹配
-                if let Some(m) = models.iter().find(|m| m.id == target) {
-                    self.current_model = m.id.clone();
-                    self.config.default_model = self.current_model.clone();
-                    let _ = self.config.save();
-                    println!("✔ 已切换至模型: {}", self.current_model.green().bold());
-                    return;
-                }
-                // 2. 模糊匹配
-                if let Some(m) = models.iter().find(|m| {
-                    m.id.strip_prefix("global:").unwrap_or(&m.id) == target
-                        || m.id.strip_prefix("cn:").unwrap_or(&m.id) == target
-                        || m.id.contains(target)
-                }) {
-                    self.current_model = m.id.clone();
-                    self.config.default_model = self.current_model.clone();
-                    let _ = self.config.save();
-                    println!("✔ 匹配并切换至模型: {}", self.current_model.green().bold());
-                    return;
+                if let Some(m) = models.iter().find(|m| m.clean_id().eq_ignore_ascii_case(clean_target)) {
+                    m.clean_id().to_string()
+                } else if let Some(m) = models.iter().find(|m| m.id.eq_ignore_ascii_case(target)) {
+                    m.clean_id().to_string()
+                } else if let Some(m) = models.iter().find(|m| m.clean_id().to_lowercase().contains(&clean_target.to_lowercase())) {
+                    m.clean_id().to_string()
+                } else {
+                    clean_target.to_string()
                 }
             }
-            Err(_) => {}
-        }
+            Err(_) => clean_target.to_string(),
+        };
 
-        self.current_model = target.to_string();
+        self.current_model = resolved_id.clone();
         self.config.default_model = self.current_model.clone();
         let _ = self.config.save();
-        println!("✔ 已指定切换至模型: {}", self.current_model.green().bold());
+
+        let display_name = crate::models_catalog::find_official_model(&self.current_model)
+            .map(|d| format!("{} ({})", d.name, self.current_model))
+            .unwrap_or_else(|| self.current_model.clone());
+
+        println!("✔ 已切换至模型: {}", display_name.green().bold());
     }
 
     async fn handle_chat(&mut self, query: &str) {
         self.messages.push(ChatMessage::user(query));
 
-        let model_display = if self.current_model.contains("deepseek") {
-            "DeepSeek".magenta().bold()
+        let model_name = crate::models_catalog::find_official_model(&self.current_model)
+            .map(|d| d.name)
+            .unwrap_or(&self.current_model);
+
+        let model_display = if model_name.contains("DeepSeek") {
+            model_name.magenta().bold()
+        } else if model_name.contains("Auto") || model_name.contains("Fast") || model_name.contains("Balanced") {
+            model_name.cyan().bold()
         } else {
-            "AI".blue().bold()
+            model_name.blue().bold()
         };
 
         let mode_tag = if self.agent_mode { "[Agent]" } else { "[Chat]" };

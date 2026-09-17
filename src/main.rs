@@ -1,6 +1,7 @@
 mod agent;
 mod client;
 mod config;
+mod models_catalog;
 mod oauth;
 mod repl;
 mod skills;
@@ -90,8 +91,7 @@ async fn main() {
 
     // 检查是否为直接登录命令
     if let Some(realm_opt) = cli.login {
-        let realm = realm_opt.unwrap_or_else(|| "cn".to_string());
-        println!("正在发起 OAuth 登录流程 (域: {})...", realm);
+        let realm = realm_opt.unwrap_or_default();
         if let Err(e) = run_oauth_login(&realm).await {
             eprintln!("{} {}", "登录失败:".red().bold(), e);
             std::process::exit(1);
@@ -176,22 +176,7 @@ async fn main() {
         println!("{}", "── 正在从网关获取模型列表 ──".cyan().bold());
         match client.list_models().await {
             Ok(models) => {
-                for m in models {
-                    let mark = if m.id == config.default_model {
-                        "● [默认]".green().bold()
-                    } else {
-                        "○".dimmed()
-                    };
-                    let credits = m.credits.unwrap_or_else(|| "-".into());
-                    let desc = m.description.unwrap_or_default();
-                    println!(
-                        "  {} {:<32} {:<10} {}",
-                        mark,
-                        m.id.yellow().bold(),
-                        format!("[{}]", credits).dimmed(),
-                        desc.dimmed()
-                    );
-                }
+                models_catalog::display_models_catalog(&models, &config.default_model);
             }
             Err(e) => {
                 eprintln!("{} {}", "获取模型列表失败:".red().bold(), e);

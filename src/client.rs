@@ -80,26 +80,41 @@ impl ApiClient {
     }
 
     pub async fn resolve_model_id(&self, model: &str) -> String {
+        let clean_target = match model.trim().to_lowercase().as_str() {
+            "auto" => "default-model",
+            "fast" => "fast-model",
+            "balanced" => "balanced-model",
+            "primary" => "primary-model",
+            "deep" => "deep-model",
+            "deepseek" | "ds" => "deepseek-v4.1-flash",
+            "kimi" => "kimi-k3",
+            "glm" => "glm-5.3",
+            "gemini" => "gemini-3.5-flash",
+            _ => model.trim(),
+        };
+
         if let Ok(models) = self.list_models().await {
-            // 1. 完全匹配
-            if models.iter().any(|m| m.id == model) {
-                return model.to_string();
+            // 1. clean_id 完全匹配
+            if let Some(m) = models.iter().find(|m| m.clean_id().eq_ignore_ascii_case(clean_target)) {
+                return m.id.clone();
             }
-            // 2. global: 前缀匹配
-            let global_id = format!("global:{}", model);
-            if models.iter().any(|m| m.id == global_id) {
-                return global_id;
+            // 2. 原始 ID 完全匹配
+            if let Some(m) = models.iter().find(|m| m.id == model) {
+                return m.id.clone();
             }
-            // 3. cn: 前缀匹配
-            let cn_id = format!("cn:{}", model);
-            if models.iter().any(|m| m.id == cn_id) {
-                return cn_id;
+            // 3. global / cn 前缀匹配
+            let global_id = format!("global:{}", clean_target);
+            if let Some(m) = models.iter().find(|m| m.id == global_id) {
+                return m.id.clone();
             }
-            // 4. 去除前缀后匹配
+            let cn_id = format!("cn:{}", clean_target);
+            if let Some(m) = models.iter().find(|m| m.id == cn_id) {
+                return m.id.clone();
+            }
+            // 4. 包含匹配
             if let Some(m) = models.iter().find(|m| {
-                m.id.strip_prefix("global:").unwrap_or(&m.id) == model
-                    || m.id.strip_prefix("cn:").unwrap_or(&m.id) == model
-                    || m.id.contains(model)
+                m.clean_id().contains(clean_target)
+                    || m.display_name().to_lowercase().contains(&clean_target.to_lowercase())
             }) {
                 return m.id.clone();
             }
