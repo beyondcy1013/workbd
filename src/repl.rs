@@ -6,8 +6,27 @@ use crate::skills::SkillRegistry;
 use crate::types::ChatMessage;
 use colored::*;
 use rustyline::error::ReadlineError;
-use rustyline::DefaultEditor;
+use rustyline::{
+    Cmd, ConditionalEventHandler, DefaultEditor, Event, EventContext, EventHandler, KeyEvent,
+    RepeatCount,
+};
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+struct CtrlCClearHandler {
+    interrupted_line: Arc<Mutex<Option<String>>>,
+}
+
+impl ConditionalEventHandler for CtrlCClearHandler {
+    fn handle(&self, _evt: &Event, _n: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
+        let line = ctx.line().trim();
+        if !line.is_empty() {
+            *self.interrupted_line.lock().unwrap() = Some(line.to_string());
+        }
+        Some(Cmd::Interrupt)
+    }
+}
 
 pub struct ReplSession {
     config: AppConfig,
@@ -82,6 +101,14 @@ impl ReplSession {
             DefaultEditor::new().unwrap()
         });
 
+        let interrupted_line = Arc::new(Mutex::new(None));
+        let ctrl_c_handler = Box::new(CtrlCClearHandler {
+            interrupted_line: Arc::clone(&interrupted_line),
+        });
+
+        let _ = rl.bind_sequence(KeyEvent::ctrl('c'), EventHandler::Conditional(ctrl_c_handler.clone()));
+        let _ = rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(ctrl_c_handler));
+
         let _ = rl.load_history(&history_file);
 
         loop {
@@ -111,7 +138,13 @@ impl ReplSession {
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
-                    println!("{}", "^C (再次按 Ctrl+C 或输入 /exit 退出)".dimmed());
+                    // 如果清屏前输入行中有未提交的内容，将其存入历史缓存，按方向键上下可立刻找回
+                    if let Some(draft) = interrupted_line.lock().unwrap().take() {
+                        let _ = rl.add_history_entry(&draft);
+                    }
+                    // 一次 Ctrl+C 全终端清屏并将光标复位
+                    print!("\x1B[2J\x1B[1;1H\x1B[3J");
+                    let _ = io::stdout().flush();
                 }
                 Err(ReadlineError::Eof) => {
                     println!("{}", "\n再见！".green());
